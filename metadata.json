@@ -1,0 +1,6 @@
+{
+  "name": "DFM Review 資料庫與動態報告工作台",
+  "description": "專為硬體工程與 PCB Layout DFM Review 打造的模組化問題點、改善建議與動態填空報告資料庫管理工具。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
