@@ -3,17 +3,19 @@ import {
   Copy,
   Check,
   FilePlus2,
-  ClipboardCheck,
   Trash2,
   FileSpreadsheet,
   AlertTriangle,
   MousePointerClick,
+  Maximize2,
+  X,
 } from 'lucide-react';
 import { DfmTemplate, CompiledReportItem } from '../types/dfm';
 import {
   compileTemplateText,
   parseTemplateSegments,
 } from '../utils/templateParser';
+import { exportBatchToExcel } from '../utils/excelExporter';
 
 interface ReportPreviewPanelProps {
   template: DfmTemplate;
@@ -38,6 +40,7 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
 }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'single' | 'batch'>('single');
+  const [isImageZoomed, setIsImageZoomed] = useState(false);
 
   const compiledIssue = compileTemplateText(
     template.issueTemplate,
@@ -78,80 +81,6 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
     }
   };
 
-  const buildFullReportText = () => {
-    const lines = [
-      `【DFM Review 報告】${template.title}`,
-      `------------------------------------------------------------`,
-      `[DFM 問題點]：`,
-      compiledIssue,
-      ``,
-      `[DFM 修改建議]：`,
-      compiledRecommendation,
-      ``,
-      `------------------------------------------------------------`,
-      `項目編號：${template.code} · 製程分類：${template.category} · 參考機種：${template.referenceModel || '未指定'}`,
-      `參考資料：${template.referenceSpec || '無'}`,
-    ];
-    if (template.imageCaption) {
-      lines.push(`附圖說明：${template.imageCaption}`);
-    }
-    return lines.join('\n');
-  };
-
-  // Horizontal TSV Row for pasting directly into Excel / Word / PowerPoint tables
-  const buildHorizontalTsvRow = () => {
-    return [
-      compiledIssue.replace(/\s+/g, ' '),
-      compiledRecommendation.replace(/\s+/g, ' '),
-      template.code,
-      template.category,
-      template.referenceModel || '-',
-      (template.referenceSpec || '-').replace(/\s+/g, ' '),
-    ].join('\t');
-  };
-
-  const buildBatchReportText = () => {
-    if (reportBatch.length === 0) return '';
-    const header = `=== DFM Review 審查報告彙整 (共 ${reportBatch.length} 項) ===\n產出日期：${new Date().toISOString().slice(0, 10)}\n\n`;
-    const body = reportBatch
-      .map(
-        (item, index) =>
-          `[項次 #${index + 1}] ${item.title}\n` +
-          `• DFM 問題點：${item.compiledIssue}\n` +
-          `• DFM 修改建議：${item.compiledRecommendation}\n` +
-          `• 編號：${item.code} | 製程分類：${item.category} | 參考機種：${item.referenceModel || '未指定'}\n` +
-          `• 參考資料：${item.referenceSpec || '無'}`
-      )
-      .join('\n------------------------------------------------------------\n');
-    return header + body;
-  };
-
-  const buildBatchTsvForExcel = () => {
-    const header = [
-      '項次',
-      'DFM 項目名稱',
-      'DFM 問題點',
-      'DFM 修改建議',
-      '編號',
-      '製程分類',
-      '參考機種',
-      '參考資料',
-    ].join('\t');
-    const rows = reportBatch.map((item, idx) =>
-      [
-        idx + 1,
-        item.title,
-        item.compiledIssue.replace(/\s+/g, ' '),
-        item.compiledRecommendation.replace(/\s+/g, ' '),
-        item.code,
-        item.category,
-        item.referenceModel || '-',
-        (item.referenceSpec || '').replace(/\s+/g, ' '),
-      ].join('\t')
-    );
-    return [header, ...rows].join('\n');
-  };
-
   return (
     <div className="bg-white border border-slate-200/90 rounded-2xl shadow-2xs overflow-hidden flex flex-col w-full">
       {/* Top Preview Switcher & Action Bar */}
@@ -190,61 +119,39 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => triggerCopy('full', buildFullReportText())}
-            className="flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-          >
-            {copiedKey === 'full' ? (
-              <>
-                <Check className="w-3.5 h-3.5" />
-                已複製完整報告！
-              </>
-            ) : (
-              <>
-                <Copy className="w-3.5 h-3.5" />
-                一鍵複製完整報告
-              </>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => triggerCopy('tsv', buildHorizontalTsvRow())}
-            className="flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 transition-colors whitespace-nowrap shrink-0"
-          >
-            {copiedKey === 'tsv' ? (
-              <>
-                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                已複製表格列
-              </>
-            ) : (
-              <>
-                <FileSpreadsheet className="w-3.5 h-3.5 text-slate-500" />
-                複製表格列 (Excel)
-              </>
-            )}
-          </button>
-
-          <button
-            type="button"
             onClick={onAddToBatch}
-            className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg hover:bg-blue-100 transition-colors whitespace-nowrap shrink-0"
           >
             <FilePlus2 className="w-3.5 h-3.5" />
             加入報告清單
           </button>
+
+          {reportBatch.length > 0 && (
+            <button
+              type="button"
+              onClick={() => exportBatchToExcel(reportBatch)}
+              className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              匯出 Excel 報表 ({reportBatch.length} 筆)
+            </button>
+          )}
         </div>
       </div>
 
       {activeTab === 'single' ? (
         <div className="p-5 sm:p-6 space-y-5">
           {/* =================================================================
-              UPPER PRIMARY TABLE: DFM 問題點 / 圖片 / DFM 修改建議 (Large & Prominent)
+              UPPER PRIMARY TABLE:
+              - Left (3 cols): DFM 問題點
+              - Center (6 cols — 1.5x Larger!): 圖片 / 不良畫面 (Image)
+              - Right (3 cols): DFM 修改建議
           ================================================================= */}
           <div className="border border-slate-200 rounded-xl overflow-hidden bg-white shadow-2xs">
             {/* Desktop Table Header */}
             <div className="hidden lg:grid lg:grid-cols-12 bg-slate-900 text-white text-xs sm:text-sm font-semibold divide-x divide-slate-700/80">
-              <div className="lg:col-span-4 px-5 py-3 flex items-center justify-between">
-                <span>DFM 問題點 (Issue Description)</span>
+              <div className="lg:col-span-3 px-4 py-3 flex items-center justify-between">
+                <span>DFM 問題點 (Issue)</span>
                 <button
                   type="button"
                   onClick={() => triggerCopy('issue', compiledIssue)}
@@ -258,21 +165,28 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      複製問題點
+                      複製
                     </>
                   )}
                 </button>
               </div>
 
-              <div className="lg:col-span-4 px-5 py-3 flex items-center justify-between">
+              <div className="lg:col-span-6 px-5 py-3 flex items-center justify-between">
                 <span>圖片 / 不良畫面 (Image)</span>
-                <span className="text-[11px] font-normal text-slate-400 font-mono">
-                  16:9 工程檢視
-                </span>
+                {template.imageUrl && (
+                  <button
+                    type="button"
+                    onClick={() => setIsImageZoomed(true)}
+                    className="text-xs font-normal text-slate-300 hover:text-white flex items-center gap-1 transition-colors"
+                  >
+                    <Maximize2 className="w-3.5 h-3.5" />
+                    點擊全螢幕放大
+                  </button>
+                )}
               </div>
 
-              <div className="lg:col-span-4 px-5 py-3 flex items-center justify-between">
-                <span>DFM 修改建議 (Recommendation)</span>
+              <div className="lg:col-span-3 px-4 py-3 flex items-center justify-between">
+                <span>DFM 修改建議 (Action)</span>
                 <button
                   type="button"
                   onClick={() => triggerCopy('rec', compiledRecommendation)}
@@ -286,17 +200,17 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      複製建議
+                      複製
                     </>
                   )}
                 </button>
               </div>
             </div>
 
-            {/* Primary 3-Column Body Row */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch min-h-[280px]">
-              {/* Column 1 (4 cols): DFM 問題點 */}
-              <div className="lg:col-span-4 p-5 sm:p-6 bg-white flex flex-col justify-between">
+            {/* Primary 3-Column Body Row (3 cols + 6 cols Large Image + 3 cols) */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 items-stretch min-h-[380px]">
+              {/* Column 1 (3 cols): DFM 問題點 */}
+              <div className="lg:col-span-3 p-5 bg-white flex flex-col justify-between">
                 <div className="space-y-3">
                   <div className="flex items-center justify-between lg:hidden pb-2 border-b border-slate-100">
                     <span className="text-xs font-bold text-slate-900">
@@ -347,63 +261,69 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                     <MousePointerClick className="w-3.5 h-3.5 text-blue-500" />
                     點選藍字變數可跳轉下方編輯欄
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => triggerCopy('issue', compiledIssue)}
-                    className="text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1"
-                  >
-                    <Copy className="w-3 h-3" />
-                    {copiedKey === 'issue' ? '已複製文字' : '單獨複製'}
-                  </button>
                 </div>
               </div>
 
-              {/* Column 2 (4 cols): 圖片 (Large Center Visual Viewport) */}
-              <div className="lg:col-span-4 p-4 sm:p-5 bg-slate-50/50 flex flex-col justify-between space-y-3">
-                <div className="lg:hidden text-xs font-bold text-slate-900 pb-1">
-                  圖片 / 不良畫面 (Image)
+              {/* Column 2 (6 cols — 1.5x Larger Center Visual Viewport!): 圖片 */}
+              <div className="lg:col-span-6 p-3 sm:p-4 bg-slate-950 flex flex-col justify-between">
+                <div className="flex items-center justify-between lg:hidden pb-2 text-white">
+                  <span className="text-xs font-bold">
+                    圖片 / 不良畫面 (Image)
+                  </span>
+                  {template.imageUrl && (
+                    <button
+                      type="button"
+                      onClick={() => setIsImageZoomed(true)}
+                      className="text-xs text-slate-300 flex items-center gap-1"
+                    >
+                      <Maximize2 className="w-3.5 h-3.5" />
+                      放大檢視
+                    </button>
+                  )}
                 </div>
 
                 {template.imageUrl ? (
-                  <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-950 shadow-2xs">
-                    <div className="relative w-full aspect-16/10 flex items-center justify-center">
-                      <img
-                        src={template.imageUrl}
-                        alt={template.imageCaption || template.title}
-                        referrerPolicy="no-referrer"
-                        className="w-full h-full object-contain"
-                      />
-                      {(template.annotations || []).map((pin, idx) => (
-                        <div
-                          key={pin.id}
-                          style={{ left: `${pin.x}%`, top: `${pin.y}%` }}
-                          className="absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1 pointer-events-none"
-                        >
-                          <span className="w-5 h-5 rounded-full bg-red-600 border border-white text-white font-mono text-[11px] font-bold flex items-center justify-center shadow-sm tabular-nums">
-                            {idx + 1}
-                          </span>
-                          <span className="px-2 py-0.5 bg-slate-950/90 border border-red-500/80 text-white text-[11px] rounded shadow-sm whitespace-nowrap">
-                            {pin.label}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
+                  <div
+                    onClick={() => setIsImageZoomed(true)}
+                    title="點擊可全螢幕放大檢視"
+                    className="relative w-full min-h-[300px] sm:min-h-[360px] lg:min-h-[380px] flex-1 flex items-center justify-center overflow-hidden rounded-lg cursor-zoom-in"
+                  >
+                    <img
+                      src={template.imageUrl}
+                      alt={template.imageCaption || template.title}
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full max-h-[440px] object-contain"
+                    />
+                    {(template.annotations || []).map((pin, idx) => (
+                      <div
+                        key={pin.id}
+                        style={{ left: `${pin.x}%`, top: `${pin.y}%` }}
+                        className="absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1.5 pointer-events-none"
+                      >
+                        <span className="w-6 h-6 rounded-full bg-red-600 border-2 border-white text-white font-mono text-xs font-bold flex items-center justify-center shadow-md tabular-nums">
+                          {idx + 1}
+                        </span>
+                        <span className="px-2 py-0.5 bg-slate-950/90 border border-red-500/80 text-white text-xs rounded shadow-md whitespace-nowrap">
+                          {pin.label}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 ) : (
-                  <div className="w-full aspect-16/10 rounded-xl border border-dashed border-slate-300 bg-white flex items-center justify-center text-xs text-slate-400">
+                  <div className="w-full min-h-[320px] flex-1 rounded-lg border border-dashed border-slate-700 bg-slate-900 flex items-center justify-center text-xs text-slate-400">
                     尚未設定圖片
                   </div>
                 )}
 
                 {template.imageCaption && (
-                  <p className="text-xs text-slate-600 text-center leading-snug px-1">
+                  <p className="text-xs text-slate-300 text-center leading-snug pt-2.5 px-2">
                     {template.imageCaption}
                   </p>
                 )}
               </div>
 
-              {/* Column 3 (4 cols): DFM 修改建議 */}
-              <div className="lg:col-span-4 p-5 sm:p-6 bg-white flex flex-col justify-between">
+              {/* Column 3 (3 cols): DFM 修改建議 */}
+              <div className="lg:col-span-3 p-5 bg-white flex flex-col justify-between">
                 <div className="space-y-3">
                   <div className="flex items-center justify-between lg:hidden pb-2 border-b border-slate-100">
                     <span className="text-xs font-bold text-slate-900">
@@ -454,14 +374,6 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                     <MousePointerClick className="w-3.5 h-3.5 text-emerald-600" />
                     點選綠字變數可跳轉下方編輯欄
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => triggerCopy('rec', compiledRecommendation)}
-                    className="text-emerald-700 hover:text-emerald-900 font-medium flex items-center gap-1"
-                  >
-                    <Copy className="w-3 h-3" />
-                    {copiedKey === 'rec' ? '已複製文字' : '單獨複製'}
-                  </button>
                 </div>
               </div>
             </div>
@@ -541,7 +453,7 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
           </div>
         </div>
       ) : (
-        /* BATCH HORIZONTAL REPORT TABLE VIEW (報告彙整清單) */
+        /* BATCH HORIZONTAL REPORT TABLE VIEW (報告彙整清單 — 直接匯出為格式完整的 Excel 檔案) */
         <div className="p-5 space-y-4">
           {reportBatch.length === 0 ? (
             <div className="py-12 px-4 text-center space-y-3">
@@ -551,7 +463,7 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                   目前報告彙整清單尚無項目
                 </p>
                 <p className="text-xs text-slate-500 max-w-md mx-auto">
-                  在下方調整動態數值後，點擊右上角「加入報告清單」，即可在此檢視多筆橫向總表並匯出至 Excel。
+                  在下方調整動態數值後，點擊右上角「加入報告清單」，即可在此檢視多筆總表並直接匯出成格式鎖定的 Excel 報表。
                 </p>
               </div>
               <button
@@ -569,42 +481,15 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
-                    onClick={() =>
-                      triggerCopy('batch-tsv', buildBatchTsvForExcel())
-                    }
-                    className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
+                    onClick={() => exportBatchToExcel(reportBatch)}
+                    className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
                   >
-                    {copiedKey === 'batch-tsv' ? (
-                      <>
-                        <Check className="w-3.5 h-3.5" />
-                        已複製橫向 Excel 表格
-                      </>
-                    ) : (
-                      <>
-                        <FileSpreadsheet className="w-3.5 h-3.5" />
-                        複製全部為 Excel 表格 ({reportBatch.length} 筆)
-                      </>
-                    )}
+                    <FileSpreadsheet className="w-4 h-4" />
+                    直接匯出成 Excel 報表 (.xls，共 {reportBatch.length} 筆)
                   </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      triggerCopy('batch-text', buildBatchReportText())
-                    }
-                    className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
-                  >
-                    {copiedKey === 'batch-text' ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-emerald-600" />
-                        已複製純文字彙整
-                      </>
-                    ) : (
-                      <>
-                        <ClipboardCheck className="w-3.5 h-3.5" />
-                        複製純文字彙整
-                      </>
-                    )}
-                  </button>
+                  <span className="text-xs text-slate-500">
+                    自動鎖定欄寬、格線與儲存格內自動換行，開啟不跑版
+                  </span>
                 </div>
                 <button
                   type="button"
@@ -616,16 +501,16 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
               </div>
 
               <div className="border border-slate-200 rounded-xl overflow-x-auto">
-                <table className="w-full min-w-[960px] text-left border-collapse">
+                <table className="w-full min-w-[1060px] text-left border-collapse">
                   <thead>
                     <tr className="bg-slate-900 text-white text-xs font-semibold divide-x divide-slate-700">
-                      <th className="py-2.5 px-3 w-12 text-center">#</th>
-                      <th className="py-2.5 px-3">DFM 問題點</th>
-                      <th className="py-2.5 px-3 w-52">圖片 (Image)</th>
-                      <th className="py-2.5 px-3">DFM 修改建議</th>
-                      <th className="py-2.5 px-3 w-44">編號 / 製程分類 / 參考機種</th>
-                      <th className="py-2.5 px-3 w-52">參考資料</th>
-                      <th className="py-2.5 px-2 w-12 text-center">移除</th>
+                      <th className="py-3 px-3 w-12 text-center">#</th>
+                      <th className="py-3 px-3">DFM 問題點</th>
+                      <th className="py-3 px-3 w-72">圖片 (Image)</th>
+                      <th className="py-3 px-3">DFM 修改建議</th>
+                      <th className="py-3 px-3 w-44">編號 / 製程分類 / 參考機種</th>
+                      <th className="py-3 px-3 w-52">參考資料</th>
+                      <th className="py-3 px-2 w-12 text-center">移除</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 text-xs">
@@ -634,31 +519,31 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                         key={item.id}
                         className="divide-x divide-slate-200 hover:bg-slate-50/80 align-top"
                       >
-                        <td className="py-3 px-3 font-mono font-bold text-slate-700 text-center tabular-nums">
+                        <td className="py-3.5 px-3 font-mono font-bold text-slate-700 text-center tabular-nums">
                           {idx + 1}
                         </td>
-                        <td className="py-3 px-3 text-slate-800 leading-relaxed">
+                        <td className="py-3.5 px-3 text-slate-800 leading-relaxed">
                           <div className="font-bold text-slate-900 mb-1">
                             {item.title}
                           </div>
                           {item.compiledIssue}
                         </td>
-                        <td className="py-3 px-3">
+                        <td className="py-3.5 px-3">
                           {item.imageUrl ? (
                             <img
                               src={item.imageUrl}
                               alt={item.title}
                               referrerPolicy="no-referrer"
-                              className="w-44 aspect-16/10 object-contain bg-slate-950 rounded border border-slate-200"
+                              className="w-64 sm:w-72 aspect-16/10 object-contain bg-slate-950 rounded-lg border border-slate-200"
                             />
                           ) : (
                             <span className="text-slate-400">無圖面</span>
                           )}
                         </td>
-                        <td className="py-3 px-3 text-slate-800 leading-relaxed">
+                        <td className="py-3.5 px-3 text-slate-800 leading-relaxed">
                           {item.compiledRecommendation}
                         </td>
-                        <td className="py-3 px-3 space-y-1">
+                        <td className="py-3.5 px-3 space-y-1">
                           <div className="font-mono font-bold text-slate-900">
                             {item.code}
                           </div>
@@ -669,10 +554,10 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                             機種：{item.referenceModel || '未填寫'}
                           </div>
                         </td>
-                        <td className="py-3 px-3 font-mono text-slate-600 leading-relaxed">
+                        <td className="py-3.5 px-3 font-mono text-slate-600 leading-relaxed">
                           {item.referenceSpec || '-'}
                         </td>
-                        <td className="py-3 px-2 text-center">
+                        <td className="py-3.5 px-2 text-center">
                           <button
                             type="button"
                             onClick={() => onRemoveFromBatch(item.id)}
@@ -689,6 +574,59 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
               </div>
             </>
           )}
+        </div>
+      )}
+
+      {/* Full-Screen Lightbox Modal when user clicks image to inspect details */}
+      {isImageZoomed && template.imageUrl && (
+        <div
+          onClick={() => setIsImageZoomed(false)}
+          className="fixed inset-0 z-50 bg-slate-950/90 flex items-center justify-center p-4 sm:p-8"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative max-w-5xl w-full bg-slate-900 border border-slate-700 rounded-2xl overflow-hidden shadow-2xl"
+          >
+            <div className="px-5 py-3 bg-slate-800 border-b border-slate-700 flex items-center justify-between text-white">
+              <span className="text-sm font-bold truncate">
+                {template.code} — {template.title}
+              </span>
+              <button
+                type="button"
+                onClick={() => setIsImageZoomed(false)}
+                className="p-1 text-slate-300 hover:text-white rounded-lg hover:bg-slate-700 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="relative w-full aspect-16/9 bg-slate-950 flex items-center justify-center">
+              <img
+                src={template.imageUrl}
+                alt={template.imageCaption || template.title}
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-contain"
+              />
+              {(template.annotations || []).map((pin, idx) => (
+                <div
+                  key={pin.id}
+                  style={{ left: `${pin.x}%`, top: `${pin.y}%` }}
+                  className="absolute -translate-x-1/2 -translate-y-1/2 flex items-center gap-1.5 pointer-events-none"
+                >
+                  <span className="w-7 h-7 rounded-full bg-red-600 border-2 border-white text-white font-mono text-sm font-bold flex items-center justify-center shadow-lg tabular-nums">
+                    {idx + 1}
+                  </span>
+                  <span className="px-2.5 py-1 bg-slate-950/90 border border-red-500 text-white text-xs sm:text-sm rounded-md shadow-lg whitespace-nowrap">
+                    {pin.label}
+                  </span>
+                </div>
+              ))}
+            </div>
+            {template.imageCaption && (
+              <div className="px-5 py-3 bg-slate-900 border-t border-slate-800 text-xs sm:text-sm text-slate-300 text-center">
+                {template.imageCaption}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
