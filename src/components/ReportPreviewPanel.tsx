@@ -126,16 +126,38 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
             加入報告清單
           </button>
 
-          {reportBatch.length > 0 && (
-            <button
-              type="button"
-              onClick={() => exportBatchToExcel(reportBatch)}
-              className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-            >
-              <FileSpreadsheet className="w-4 h-4" />
-              匯出 Excel 報表 ({reportBatch.length} 筆)
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => {
+              if (reportBatch.length > 0) {
+                exportBatchToExcel(reportBatch);
+              } else {
+                exportBatchToExcel([
+                  {
+                    id: `single-${Date.now()}`,
+                    templateId: template.id,
+                    code: template.code,
+                    title: template.title,
+                    category: template.category,
+                    referenceModel: template.referenceModel,
+                    compiledIssue,
+                    compiledRecommendation,
+                    referenceSpec: template.referenceSpec,
+                    imageUrl: template.imageUrl,
+                    imageCaption: template.imageCaption,
+                    annotations: template.annotations,
+                    variableValues: { ...variableValues },
+                    createdAt: new Date().toISOString(),
+                  },
+                ]);
+              }
+            }}
+            className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            匯出 Excel 報表
+            {reportBatch.length > 0 ? ` (${reportBatch.length} 筆)` : ''}
+          </button>
         </div>
       </div>
 
@@ -453,7 +475,7 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
           </div>
         </div>
       ) : (
-        /* BATCH HORIZONTAL REPORT TABLE VIEW (報告彙整清單 — 直接匯出為格式完整的 Excel 檔案) */
+        /* BATCH HORIZONTAL REPORT TABLE VIEW (報告彙整清單 — 由右上角按鈕匯出 Excel) */
         <div className="p-5 space-y-4">
           {reportBatch.length === 0 ? (
             <div className="py-12 px-4 text-center space-y-3">
@@ -463,7 +485,7 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                   目前報告彙整清單尚無項目
                 </p>
                 <p className="text-xs text-slate-500 max-w-md mx-auto">
-                  在下方調整動態數值後，點擊右上角「加入報告清單」，即可在此檢視多筆總表並直接匯出成格式鎖定的 Excel 報表。
+                  在下方調整動態數值後，點擊右上角「加入報告清單」，再點擊右上角「匯出 Excel 報表」即可下載內嵌圖片的完整 Excel (.xlsx) 檔案。
                 </p>
               </div>
               <button
@@ -478,19 +500,9 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
           ) : (
             <>
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => exportBatchToExcel(reportBatch)}
-                    className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 rounded-lg hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 shadow-2xs"
-                  >
-                    <FileSpreadsheet className="w-4 h-4" />
-                    直接匯出成 Excel 報表 (.xls，共 {reportBatch.length} 筆)
-                  </button>
-                  <span className="text-xs text-slate-500">
-                    自動鎖定欄寬、格線與儲存格內自動換行，開啟不跑版
-                  </span>
-                </div>
+                <span className="text-xs text-slate-500">
+                  共 {reportBatch.length} 筆 DFM 案例項目 · 請點擊右上角「匯出 Excel 報表」下載含內嵌圖片與鎖定排版的 .xlsx 檔案
+                </span>
                 <button
                   type="button"
                   onClick={onClearBatch}
