@@ -17,12 +17,15 @@ import {
   Undo2,
   Redo2,
   Save,
+  Images,
+  Lock,
 } from 'lucide-react';
 import {
   DfmTemplate,
   DfmCategory,
   CompiledReportItem,
   ReferenceSpecItem,
+  DfmDrawingItem,
 } from './types/dfm';
 import {
   DEFAULT_DFM_TEMPLATES,
@@ -39,12 +42,19 @@ import { ImageInspector } from './components/ImageInspector';
 import { ReportPreviewPanel } from './components/ReportPreviewPanel';
 import { SpecDatabaseManager } from './components/SpecDatabaseManager';
 import { DynamicValueQuickEditor } from './components/DynamicValueQuickEditor';
+import { DfmDrawingGallery } from './components/DfmDrawingGallery';
+import {
+  LoginGate,
+  isDailySessionAuthenticated,
+  clearDailySessionAuth,
+} from './components/LoginGate';
 
 const STORAGE_KEY_TEMPLATES = 'dfm_vault_templates_v2';
 const STORAGE_KEY_BATCH = 'dfm_vault_report_batch_v2';
 const STORAGE_KEY_SPECS = 'dfm_vault_specs_v2';
+const STORAGE_KEY_DRAWINGS = 'dfm_vault_drawings_v2';
 
-type WorkspaceTab = 'database' | 'editor' | 'report';
+type WorkspaceTab = 'database' | 'editor' | 'report' | 'gallery';
 
 const QUICK_VARIABLES = [
   '零件編號',
@@ -78,6 +88,11 @@ function cloneTemplate(tpl: DfmTemplate): DfmTemplate {
 }
 
 export default function App() {
+  // 0. Daily Password Authentication State (DV + 今日日期)
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() =>
+    isDailySessionAuthenticated()
+  );
+
   // 1. Load Templates from localStorage or fall back to DEFAULT_DFM_TEMPLATES
   const [templates, setTemplates] = useState<DfmTemplate[]>(() => {
     try {
@@ -128,7 +143,23 @@ export default function App() {
     return [];
   });
 
-  // Active Main Tab: 'database' (DFM案例資料庫列表) | 'editor' (DFM案例編輯頁) | 'report' (DFM案例)
+  // 4. Load DFM Engineering Drawing Gallery (DFM工程圖庫) from localStorage
+  const [drawings, setDrawings] = useState<DfmDrawingItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_DRAWINGS);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return PRESET_CAD_DIAGRAMS;
+  });
+
+  // Active Main Tab: 'database' (DFM案例資料庫列表) | 'editor' (DFM案例編輯頁) | 'report' (DFM案例) | 'gallery' (DFM工程圖庫)
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('report');
 
   const [selectedId, setSelectedId] = useState<string>(() => {
@@ -189,6 +220,18 @@ export default function App() {
       // ignore
     }
   }, [reportBatch]);
+
+  // Sync drawings (DFM工程圖庫) to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY_DRAWINGS, JSON.stringify(drawings));
+    } catch {
+      setStatusBanner({
+        type: 'error',
+        message: '瀏覽器儲存空間已滿，建議壓縮上傳圖片或匯出 JSON 備份。',
+      });
+    }
+  }, [drawings]);
 
   const showToast = useCallback(
     (message: string, type: 'success' | 'error' = 'success') => {
@@ -323,6 +366,7 @@ export default function App() {
       });
       localStorage.setItem(STORAGE_KEY_TEMPLATES, JSON.stringify(templates));
       localStorage.setItem(STORAGE_KEY_SPECS, JSON.stringify(specs));
+      localStorage.setItem(STORAGE_KEY_DRAWINGS, JSON.stringify(drawings));
       setHistoryMap((prev) => {
         const entry = prev[activeTemplate.id] || {
           stack: [cloneTemplate(activeTemplate)],
@@ -341,7 +385,7 @@ export default function App() {
     } catch {
       showToast('儲存失敗：瀏覽器儲存空間不足', 'error');
     }
-  }, [activeTemplate, specs, templates, showToast]);
+  }, [activeTemplate, specs, templates, drawings, showToast]);
 
   // Keyboard shortcuts for Undo (Ctrl+Z), Redo (Ctrl+Y / Ctrl+Shift+Z), and Save (Ctrl+S) when on Editor Tab
   useEffect(() => {
@@ -492,6 +536,18 @@ export default function App() {
     showToast(`已刪除規範「${target?.title || ''}」`);
   };
 
+  // Apply a drawing from DFM工程圖庫 to the currently active DFM case
+  const handleApplyDrawingToCase = (drawing: DfmDrawingItem) => {
+    updateActiveTemplate({
+      imageUrl: drawing.url,
+      imageCaption: drawing.description || drawing.name,
+      annotations: drawing.annotations ? [...drawing.annotations] : [],
+    });
+    showToast(
+      `已將工程圖面「${drawing.name}」與圖片說明套用至案例「${activeTemplate.code}」`
+    );
+  };
+
   // Insert [變數] token into issueTemplate or recommendationTemplate
   const handleInsertVariableToken = (varName: string) => {
     const clean = varName.replace(/[\[\]]/g, '').trim();
@@ -543,7 +599,7 @@ export default function App() {
       recommendationTemplate:
         '建議將零件 [零件編號] 往 [方向] 調整間距至 [標準值] 以上，以符合量產可靠度要求。',
       referenceSpec: specs[0]?.content || 'IPC-2221B / 廠內硬體 DFM 設計規範',
-      imageUrl: PRESET_CAD_DIAGRAMS[0].url,
+      imageUrl: drawings[0]?.url || PRESET_CAD_DIAGRAMS[0].url,
       imageCaption: '圖示：請貼上圖片網址、上傳截圖或點擊畫面新增紅點標註',
       annotations: [],
       variableDefaults: {
@@ -600,10 +656,11 @@ export default function App() {
   const handleExportJson = () => {
     const payload = {
       app: 'DFM Case Database Workbench',
-      version: '2.5.0',
+      version: '2.6.0',
       exportedAt: new Date().toISOString(),
       templates,
       specs,
+      drawings,
       reportBatch,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
@@ -619,7 +676,9 @@ export default function App() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    showToast(`已匯出 ${templates.length} 組 DFM 案例與 ${specs.length} 筆規範資料 (JSON)`);
+    showToast(
+      `已匯出 ${templates.length} 組 DFM 案例、${drawings.length} 張工程圖面與 ${specs.length} 筆規範資料 (JSON)`
+    );
   };
 
   // Import JSON
@@ -671,6 +730,9 @@ export default function App() {
         setHistoryMap({});
         if (Array.isArray(parsed.specs) && parsed.specs.length > 0) {
           setSpecs(parsed.specs);
+        }
+        if (Array.isArray(parsed.drawings) && parsed.drawings.length > 0) {
+          setDrawings(parsed.drawings);
         }
         if (Array.isArray(parsed.reportBatch)) {
           setReportBatch(parsed.reportBatch);
@@ -733,9 +795,14 @@ export default function App() {
     });
   }, [templates, selectedCategory, searchQuery]);
 
+  // Show Login Password Gate if not authenticated
+  if (!isAuthenticated) {
+    return <LoginGate onSuccess={() => setIsAuthenticated(true)} />;
+  }
+
   return (
     <div className="min-h-screen w-full overflow-x-hidden flex flex-col bg-slate-50 text-slate-900">
-      {/* Top Header Bar: Brand Title */}
+      {/* Top Header Bar: Brand Title + Lock/Logout */}
       <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4">
         <a
           href="#top"
@@ -747,17 +814,30 @@ export default function App() {
         >
           DFM案例資料庫工作台
         </a>
+
+        <button
+          type="button"
+          onClick={() => {
+            clearDailySessionAuth();
+            setIsAuthenticated(false);
+          }}
+          title="鎖定工作台並返回密碼登入畫面"
+          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+        >
+          <Lock className="w-3.5 h-3.5 text-slate-500" />
+          <span>登出鎖定</span>
+        </button>
       </header>
 
-      {/* Sub-Header Bar: 3-Tab Segmented Switcher on Left + [匯出 JSON | 匯入 JSON] on Right */}
+      {/* Sub-Header Bar: 4-Tab Segmented Switcher on Left (DFM工程圖庫 on right of DFM案例) + [匯出 JSON | 匯入 JSON] on Right */}
       <section className="bg-white border-b border-slate-200 px-4 sm:px-6 py-2.5">
         <div className="max-w-[1440px] mx-auto flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          {/* 3-Tab Segmented Control */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5 p-1 bg-slate-100 rounded-xl w-full sm:w-auto">
+          {/* 4-Tab Segmented Control */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 p-1 bg-slate-100 rounded-xl w-full sm:w-auto">
             <button
               type="button"
               onClick={() => setActiveTab('database')}
-              className={`flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'database'
                   ? 'bg-white text-blue-700 shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -770,7 +850,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('editor')}
-              className={`flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'editor'
                   ? 'bg-white text-blue-700 shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -783,7 +863,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('report')}
-              className={`flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
                 activeTab === 'report'
                   ? 'bg-white text-blue-700 shadow-2xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -791,6 +871,19 @@ export default function App() {
             >
               <Table2 className="w-3.5 h-3.5 shrink-0" />
               <span>DFM案例</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setActiveTab('gallery')}
+              className={`flex items-center justify-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+                activeTab === 'gallery'
+                  ? 'bg-white text-blue-700 shadow-2xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Images className="w-3.5 h-3.5 shrink-0" />
+              <span>DFM工程圖庫 ({drawings.length})</span>
             </button>
           </div>
 
@@ -1427,6 +1520,7 @@ export default function App() {
                     imageUrl={activeTemplate.imageUrl}
                     imageCaption={activeTemplate.imageCaption || ''}
                     annotations={activeTemplate.annotations || []}
+                    drawings={drawings}
                     onChangeImage={(url) =>
                       updateActiveTemplate({ imageUrl: url })
                     }
@@ -1436,6 +1530,8 @@ export default function App() {
                     onChangeAnnotations={(annotations) =>
                       updateActiveTemplate({ annotations })
                     }
+                    onApplyDrawing={handleApplyDrawingToCase}
+                    onOpenDrawingGallery={() => setActiveTab('gallery')}
                   />
                 </div>
 
@@ -1516,6 +1612,22 @@ export default function App() {
             />
           </div>
         )}
+
+        {/* =====================================================================
+            TAB 4 (Right of DFM案例): DFM工程圖庫
+            Allows custom image upload, description editing, annotations, and Save/Undo/Redo
+        ===================================================================== */}
+        {activeTab === 'gallery' && (
+          <DfmDrawingGallery
+            drawings={drawings}
+            onChangeDrawings={setDrawings}
+            onApplyToCurrentCase={(drawing) => {
+              handleApplyDrawingToCase(drawing);
+              setActiveTab('report');
+            }}
+            onShowToast={showToast}
+          />
+        )}
       </main>
 
       {/* Quiet Functional Footer */}
@@ -1525,7 +1637,7 @@ export default function App() {
             DFM案例資料庫工作台 · 支援動態變數雙向點選連動與本機自動儲存
           </div>
           <div className="font-mono tabular-nums">
-            案例數：{templates.length} 筆 · 常用規範庫：{specs.length} 筆 · 報告清單：{reportBatch.length} 筆
+            案例數：{templates.length} 筆 · 工程圖庫：{drawings.length} 張 · 常用規範庫：{specs.length} 筆 · 報告清單：{reportBatch.length} 筆
           </div>
         </div>
       </footer>

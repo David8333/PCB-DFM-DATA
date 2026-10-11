@@ -1,4 +1,4 @@
-import { DfmTemplate, DfmCategory, ReferenceSpecItem } from '../types/dfm';
+import { DfmTemplate, DfmCategory, ReferenceSpecItem, DfmDrawingItem } from '../types/dfm';
 
 export const DFM_CATEGORIES: DfmCategory[] = [
   'PCB Layout',
@@ -64,10 +64,16 @@ function svgToDataUri(svgString: string): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svgString.trim())}`;
 }
 
-export const PRESET_CAD_DIAGRAMS = [
+export const PRESET_CAD_DIAGRAMS: DfmDrawingItem[] = [
   {
     id: 'edge-clearance',
     name: '併板 V-Cut 板邊間距不足 (Panel / Board Edge)',
+    category: '併板規範',
+    description: '圖示：C102 距離底部 V-Cut 板邊僅 0.28mm，侵入紅色禁佈區 (Keepout Zone ≥ 1.0mm)，分板時易受機械應力微裂。',
+    annotations: [
+      { id: 'ann-preset-1', x: 66, y: 69, label: '間距僅 0.28mm (侵入禁佈區)' },
+    ],
+    updatedAt: '2026-10-11',
     url: svgToDataUri(`
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
         <rect width="640" height="360" fill="#0f172a"/>
@@ -109,6 +115,12 @@ export const PRESET_CAD_DIAGRAMS = [
   {
     id: 'via-in-pad',
     name: 'BGA / QFN 焊墊內導孔未塞孔 (Via-in-Pad)',
+    category: 'SMT 組裝',
+    description: '圖示：左側焊墊內直接開孔導致迴焊錫膏流失與空洞；右側為建議之 Dog-Bone 扇出與 ≥0.10mm 綠漆阻焊橋。',
+    annotations: [
+      { id: 'ann-preset-2', x: 30, y: 46, label: '未塞孔導孔位於 SMD Pad 內' },
+    ],
+    updatedAt: '2026-10-11',
     url: svgToDataUri(`
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
         <rect width="640" height="360" fill="#0f172a"/>
@@ -135,6 +147,12 @@ export const PRESET_CAD_DIAGRAMS = [
   {
     id: 'thermal-relief',
     name: '大銅面直連焊墊導致冷焊/補焊困難 (Thermal Relief)',
+    category: 'PCB Layout',
+    description: '圖示：左側焊墊與大面積 GND 銅箔全直連無十字散熱橋，導致迴焊立碑及手工烙鐵補焊散熱過快。',
+    annotations: [
+      { id: 'ann-preset-3', x: 38, y: 50, label: '大銅面全直連無散熱橋' },
+    ],
+    updatedAt: '2026-10-11',
     url: svgToDataUri(`
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
         <rect width="640" height="360" fill="#0f172a"/>
@@ -154,6 +172,12 @@ export const PRESET_CAD_DIAGRAMS = [
   {
     id: 'tall-shadowing',
     name: '波峰焊錫/補焊治具陰影與高聳零件干涉',
+    category: '補焊製程',
+    description: '圖示：高聳零件 (H=12.5mm) 與鄰近微型 SMD/補焊點間距僅 0.65mm，位於烙鐵角度與波峰陰影干涉區。',
+    annotations: [
+      { id: 'ann-preset-4', x: 48, y: 68, label: '高聳零件陰影區間距僅 0.65mm' },
+    ],
+    updatedAt: '2026-10-11',
     url: svgToDataUri(`
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360">
         <rect width="640" height="360" fill="#0f172a"/>

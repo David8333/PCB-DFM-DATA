@@ -7,26 +7,33 @@ import {
   Trash2,
   Layers,
   AlertCircle,
+  ArrowUpRight,
 } from 'lucide-react';
-import { ImageAnnotation } from '../types/dfm';
+import { ImageAnnotation, DfmDrawingItem } from '../types/dfm';
 import { PRESET_CAD_DIAGRAMS } from '../data/defaultTemplates';
 
 interface ImageInspectorProps {
   imageUrl: string;
   imageCaption: string;
   annotations: ImageAnnotation[];
+  drawings?: DfmDrawingItem[];
   onChangeImage: (url: string) => void;
   onChangeCaption: (caption: string) => void;
   onChangeAnnotations: (annotations: ImageAnnotation[]) => void;
+  onApplyDrawing?: (drawing: DfmDrawingItem) => void;
+  onOpenDrawingGallery?: () => void;
 }
 
 export const ImageInspector: React.FC<ImageInspectorProps> = ({
   imageUrl,
   imageCaption,
   annotations,
+  drawings = PRESET_CAD_DIAGRAMS,
   onChangeImage,
   onChangeCaption,
   onChangeAnnotations,
+  onApplyDrawing,
+  onOpenDrawingGallery,
 }) => {
   const [inputMode, setInputMode] = useState<'url' | 'upload' | 'preset'>('url');
   const [annotateMode, setAnnotateMode] = useState(false);
@@ -95,7 +102,7 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
             ·
           </span>
           <span className="text-xs text-slate-500">
-            支援圖片網址、本機上傳與紅框標註
+            支援圖片網址、本機上傳與 DFM工程圖庫
           </span>
         </div>
 
@@ -135,7 +142,7 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            DFM 工程圖庫
+            DFM工程圖庫 ({drawings.length})
           </button>
         </div>
       </div>
@@ -193,25 +200,47 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
       )}
 
       {inputMode === 'preset' && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {PRESET_CAD_DIAGRAMS.map((preset) => (
-            <button
-              key={preset.id}
-              type="button"
-              onClick={() => {
-                setImgError(false);
-                onChangeImage(preset.url);
-              }}
-              className={`flex items-center justify-between px-3 py-2 text-xs text-left rounded-lg border transition-colors ${
-                imageUrl === preset.url
-                  ? 'border-blue-600 bg-blue-50/60 text-blue-900 font-medium'
-                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-              }`}
-            >
-              <span className="truncate">{preset.name}</span>
-              <span className="text-[11px] text-blue-600 ml-2 shrink-0">套用</span>
-            </button>
-          ))}
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>點選下方圖庫項目即可套用圖片與說明：</span>
+            {onOpenDrawingGallery && (
+              <button
+                type="button"
+                onClick={onOpenDrawingGallery}
+                className="inline-flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-800"
+              >
+                <span>前往「DFM工程圖庫」分頁管理與上傳</span>
+                <ArrowUpRight className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+            {drawings.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => {
+                  setImgError(false);
+                  if (onApplyDrawing) {
+                    onApplyDrawing(preset);
+                  } else {
+                    onChangeImage(preset.url);
+                    if (preset.description) {
+                      onChangeCaption(preset.description);
+                    }
+                  }
+                }}
+                className={`flex items-center justify-between px-3 py-2 text-xs text-left rounded-lg border transition-colors ${
+                  imageUrl === preset.url
+                    ? 'border-blue-600 bg-blue-50/60 text-blue-900 font-medium'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <span className="truncate">{preset.name}</span>
+                <span className="text-[11px] text-blue-600 ml-2 shrink-0">套用</span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -301,7 +330,7 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
                     圖片網址無法載入或格式不支援
                   </p>
                   <p className="text-[11px] text-slate-500 mt-1">
-                    請確認圖片網址公開可存取，或改用「上傳檔案」與「DFM 工程圖庫」
+                    請確認圖片網址公開可存取，或改用「上傳檔案」與「DFM工程圖庫」
                   </p>
                 </>
               ) : (

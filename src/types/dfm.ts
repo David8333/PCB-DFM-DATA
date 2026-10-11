@@ -25,6 +25,16 @@ export interface ReferenceSpecItem {
   updatedAt: string;
 }
 
+export interface DfmDrawingItem {
+  id: string;
+  name: string;
+  category: DfmCategory;
+  url: string;
+  description: string; // 圖片說明
+  annotations?: ImageAnnotation[];
+  updatedAt: string;
+}
+
 export interface DfmTemplate {
   id: string;
   code: string;
