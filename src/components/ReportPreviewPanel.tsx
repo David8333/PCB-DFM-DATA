@@ -545,6 +545,8 @@ export const ReportPreviewPanel: React.FC<ReportPreviewPanelProps> = ({
                             <img
                               src={item.imageUrl}
                               alt={item.title}
+                              loading="lazy"
+                              decoding="async"
                               referrerPolicy="no-referrer"
                               className="w-64 sm:w-72 aspect-16/10 object-contain bg-slate-950 rounded-lg border border-slate-200"
                             />

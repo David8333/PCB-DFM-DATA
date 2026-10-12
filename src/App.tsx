@@ -19,6 +19,13 @@ import {
   Save,
   Images,
   Lock,
+  HardDrive,
+  Clock,
+  ChevronLeft,
+  ChevronRight,
+  X,
+  FileCheck2,
+  Layers,
 } from 'lucide-react';
 import {
   DfmTemplate,
@@ -30,7 +37,6 @@ import {
 import {
   DEFAULT_DFM_TEMPLATES,
   DFM_CATEGORIES,
-  DEFAULT_REFERENCE_SPECS,
   PRESET_CAD_DIAGRAMS,
 } from './data/defaultTemplates';
 import {
@@ -38,6 +44,26 @@ import {
   compileTemplateText,
   parseTemplateSegments,
 } from './utils/templateParser';
+import {
+  STORAGE_KEYS,
+  SaveStatusType,
+  loadInitialTemplates,
+  loadInitialSpecs,
+  loadInitialBatch,
+  loadInitialDrawings,
+  loadLastBackupTime,
+  saveLastBackupTime,
+  safeWriteStorage,
+  estimateStorageMetrics,
+  formatBytes,
+} from './utils/storageManager';
+import {
+  ValidatedBackupPayload,
+  parseAndValidateBackupJson,
+  mergeTemplatesSafely,
+  mergeDrawingsSafely,
+  mergeSpecsSafely,
+} from './utils/jsonBackupManager';
 import { ImageInspector } from './components/ImageInspector';
 import { ReportPreviewPanel } from './components/ReportPreviewPanel';
 import { SpecDatabaseManager } from './components/SpecDatabaseManager';
@@ -49,12 +75,9 @@ import {
   clearDailySessionAuth,
 } from './components/LoginGate';
 
-const STORAGE_KEY_TEMPLATES = 'dfm_vault_templates_v2';
-const STORAGE_KEY_BATCH = 'dfm_vault_report_batch_v2';
-const STORAGE_KEY_SPECS = 'dfm_vault_specs_v2';
-const STORAGE_KEY_DRAWINGS = 'dfm_vault_drawings_v2';
-
 type WorkspaceTab = 'database' | 'editor' | 'report' | 'gallery';
+
+const MAX_TEMPLATE_HISTORY = 30;
 
 const QUICK_VARIABLES = [
   '零件編號',
@@ -83,8 +106,19 @@ function findVariableAtCursor(text: string, cursorIndex: number): string | null 
   return null;
 }
 
-function cloneTemplate(tpl: DfmTemplate): DfmTemplate {
-  return JSON.parse(JSON.stringify(tpl));
+/**
+ * Structural-sharing snapshot of a single DfmTemplate:
+ * Avoids JSON.parse(JSON.stringify(tpl)) so large immutable Base64 imageUrl strings
+ * are shared by reference without allocating duplicate copies on every keystroke.
+ */
+function snapshotTemplate(tpl: DfmTemplate): DfmTemplate {
+  return {
+    ...tpl,
+    annotations: tpl.annotations
+      ? tpl.annotations.map((pin) => ({ ...pin }))
+      : [],
+    variableDefaults: tpl.variableDefaults ? { ...tpl.variableDefaults } : {},
+  };
 }
 
 export default function App() {
@@ -93,155 +127,158 @@ export default function App() {
     isDailySessionAuthenticated()
   );
 
-  // 1. Load Templates from localStorage or fall back to DEFAULT_DFM_TEMPLATES
-  const [templates, setTemplates] = useState<DfmTemplate[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_TEMPLATES);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map((tpl: DfmTemplate) => ({
-            ...tpl,
-            category: DFM_CATEGORIES.includes(tpl.category)
-              ? tpl.category
-              : 'PCB Layout',
-            referenceModel: tpl.referenceModel ?? '',
-          }));
-        }
-      }
-    } catch {
-      // ignore storage parse error
-    }
-    return DEFAULT_DFM_TEMPLATES;
+  // 1. Centralized Safe Initial Loaders
+  const initialTemplatesResult = useMemo(() => loadInitialTemplates(), []);
+  const initialSpecsResult = useMemo(() => loadInitialSpecs(), []);
+  const initialBatchResult = useMemo(() => loadInitialBatch(), []);
+  const initialDrawingsResult = useMemo(() => loadInitialDrawings(), []);
+
+  const [templates, setTemplates] = useState<DfmTemplate[]>(
+    () => initialTemplatesResult.templates
+  );
+  const [specs, setSpecs] = useState<ReferenceSpecItem[]>(
+    () => initialSpecsResult.specs
+  );
+  const [reportBatch, setReportBatch] = useState<CompiledReportItem[]>(
+    () => initialBatchResult.batch
+  );
+  const [drawings, setDrawings] = useState<DfmDrawingItem[]>(
+    () => initialDrawingsResult.drawings
+  );
+
+  // Storage Save Status & Telemetry State
+  const [saveStatus, setSaveStatus] = useState<SaveStatusType>('saved');
+  const [lastSavedAt, setLastSavedAt] = useState<string>(() =>
+    new Date().toLocaleTimeString('zh-TW', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+  );
+  const [lastBackupAt, setLastBackupAt] = useState<string | null>(() =>
+    loadLastBackupTime()
+  );
+  const [storageWarning, setStorageWarning] = useState<string | null>(() => {
+    return (
+      initialTemplatesResult.warning ||
+      initialSpecsResult.warning ||
+      initialBatchResult.warning ||
+      initialDrawingsResult.warning ||
+      null
+    );
   });
 
-  // 2. Load Editable Reference Specs from localStorage
-  const [specs, setSpecs] = useState<ReferenceSpecItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_SPECS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {
-      // ignore
-    }
-    return DEFAULT_REFERENCE_SPECS;
-  });
+  // Pre-Import Validation & Confirmation Modal State
+  const [pendingImport, setPendingImport] =
+    useState<ValidatedBackupPayload | null>(null);
 
-  // 3. Load Batch Report Queue from localStorage
-  const [reportBatch, setReportBatch] = useState<CompiledReportItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_BATCH);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {
-      // ignore
-    }
-    return [];
-  });
-
-  // 4. Load DFM Engineering Drawing Gallery (DFM工程圖庫) from localStorage
-  const [drawings, setDrawings] = useState<DfmDrawingItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY_DRAWINGS);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
-        }
-      }
-    } catch {
-      // ignore
-    }
-    return PRESET_CAD_DIAGRAMS;
-  });
-
-  // Active Main Tab: 'database' (DFM案例資料庫列表) | 'editor' (DFM案例編輯頁) | 'report' (DFM案例) | 'gallery' (DFM工程圖庫)
+  // Active Main Tab: 'database' | 'editor' | 'report' | 'gallery'
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('report');
 
   const [selectedId, setSelectedId] = useState<string>(() => {
-    return templates[0]?.id || DEFAULT_DFM_TEMPLATES[0].id;
+    return (
+      initialTemplatesResult.templates[0]?.id || DEFAULT_DFM_TEMPLATES[0].id
+    );
   });
 
   // Active linked variable name for bidirectional highlighting & focus
   const [activeVariable, setActiveVariable] = useState<string | null>(null);
 
+  // Database List Search, Category Filter & Pagination (for 100~1,000 cases scale)
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
+  const [dbPage, setDbPage] = useState<number>(1);
+  const [dbPageSize, setDbPageSize] = useState<number>(24);
+
   const [customVarName, setCustomVarName] = useState('');
-  const [activeTextarea, setActiveTextarea] = useState<'issue' | 'recommendation'>('issue');
+  const [activeTextarea, setActiveTextarea] = useState<
+    'issue' | 'recommendation'
+  >('issue');
   const [statusBanner, setStatusBanner] = useState<{
     type: 'success' | 'error';
     message: string;
   } | null>(null);
 
-  // Per-template Undo/Redo History Map: { [templateId]: { stack: DfmTemplate[], index: number, dirty: boolean } }
+  // Per-template Undo/Redo History Map with structural sharing
   const [historyMap, setHistoryMap] = useState<
     Record<
       string,
-      { stack: DfmTemplate[]; index: number; isDirty: boolean; lastSavedAt?: string }
+      {
+        stack: DfmTemplate[];
+        index: number;
+        isDirty: boolean;
+        lastSavedAt?: string;
+      }
     >
   >({});
+
+  // Track last edit timestamp to coalesce rapid keystrokes on the same template
+  const lastTemplateEditMetaRef = useRef<{
+    templateId: string;
+    timestamp: number;
+  } | null>(null);
 
   const fileImportRef = useRef<HTMLInputElement>(null);
   const issueTextareaRef = useRef<HTMLTextAreaElement>(null);
   const recTextareaRef = useRef<HTMLTextAreaElement>(null);
   const dynamicInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
-  // Sync templates to localStorage automatically
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_TEMPLATES, JSON.stringify(templates));
-    } catch {
-      setStatusBanner({
-        type: 'error',
-        message: '瀏覽器儲存空間已滿，建議壓縮上傳圖片或匯出 JSON 備份。',
-      });
-    }
-  }, [templates]);
-
-  // Sync specs to localStorage automatically
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_SPECS, JSON.stringify(specs));
-    } catch {
-      // ignore
-    }
-  }, [specs]);
-
-  // Sync batch report items to localStorage
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_BATCH, JSON.stringify(reportBatch));
-    } catch {
-      // ignore
-    }
-  }, [reportBatch]);
-
-  // Sync drawings (DFM工程圖庫) to localStorage
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_DRAWINGS, JSON.stringify(drawings));
-    } catch {
-      setStatusBanner({
-        type: 'error',
-        message: '瀏覽器儲存空間已滿，建議壓縮上傳圖片或匯出 JSON 備份。',
-      });
-    }
-  }, [drawings]);
+  // Track initial mount so we don't needlessly re-write initial localStorage on first render
+  const isFirstMountRef = useRef(true);
 
   const showToast = useCallback(
     (message: string, type: 'success' | 'error' = 'success') => {
       setStatusBanner({ type, message });
       setTimeout(() => {
         setStatusBanner((prev) => (prev?.message === message ? null : prev));
-      }, 3000);
+      }, 3600);
     },
     []
   );
+
+  // Centralized, debounced auto-save to localStorage for templates, specs, batch, and drawings
+  useEffect(() => {
+    if (isFirstMountRef.current) {
+      isFirstMountRef.current = false;
+      return;
+    }
+
+    setSaveStatus('saving');
+    const timer = window.setTimeout(() => {
+      const r1 = safeWriteStorage(STORAGE_KEYS.TEMPLATES, templates);
+      const r2 = safeWriteStorage(STORAGE_KEYS.SPECS, specs);
+      const r3 = safeWriteStorage(STORAGE_KEYS.BATCH, reportBatch);
+      const r4 = safeWriteStorage(STORAGE_KEYS.DRAWINGS, drawings);
+
+      const failed = [r1, r2, r3, r4].find((r) => !r.ok);
+      if (failed) {
+        setSaveStatus('error');
+        setStorageWarning(
+          failed.message ||
+            '本機儲存空間寫入失敗，目前畫面資料仍保留，請立即匯出 JSON 備份。'
+        );
+      } else {
+        setSaveStatus('saved');
+        setStorageWarning(null);
+        if (r1.savedAt) {
+          setLastSavedAt(r1.savedAt);
+        }
+      }
+    }, 320);
+
+    return () => window.clearTimeout(timer);
+  }, [templates, specs, reportBatch, drawings]);
+
+  // Estimate storage capacity & counts without blocking main thread
+  const storageMetrics = useMemo(
+    () => estimateStorageMetrics(templates, drawings, specs, reportBatch),
+    [templates, drawings, specs, reportBatch]
+  );
+
+  // Reset database list page to 1 when search or category filter changes
+  useEffect(() => {
+    setDbPage(1);
+  }, [searchQuery, selectedCategory, dbPageSize]);
 
   // Current active template
   const activeTemplate = useMemo(() => {
@@ -260,7 +297,7 @@ export default function App() {
       return {
         ...prev,
         [activeTemplate.id]: {
-          stack: [cloneTemplate(activeTemplate)],
+          stack: [snapshotTemplate(activeTemplate)],
           index: 0,
           isDirty: false,
           lastSavedAt: activeTemplate.updatedAt,
@@ -276,9 +313,9 @@ export default function App() {
     : false;
   const isDirty = currentHistory ? currentHistory.isDirty : false;
 
-  // Update active template and record into Undo/Redo stack
+  // Update active template and record into structural-sharing Undo/Redo stack
   const updateActiveTemplate = useCallback(
-    (patch: Partial<DfmTemplate>) => {
+    (patch: Partial<DfmTemplate>, coalesceTyping = true) => {
       const today = new Date().toISOString().slice(0, 10);
       const nextTemplate: DfmTemplate = {
         ...activeTemplate,
@@ -292,14 +329,43 @@ export default function App() {
         )
       );
 
+      const now = Date.now();
+      const prevMeta = lastTemplateEditMetaRef.current;
+      const shouldCoalesce =
+        coalesceTyping &&
+        Boolean(
+          prevMeta &&
+            prevMeta.templateId === activeTemplate.id &&
+            now - prevMeta.timestamp < 650
+        );
+
+      lastTemplateEditMetaRef.current = coalesceTyping
+        ? { templateId: activeTemplate.id, timestamp: now }
+        : null;
+
       setHistoryMap((prev) => {
         const entry = prev[activeTemplate.id] || {
-          stack: [cloneTemplate(activeTemplate)],
+          stack: [snapshotTemplate(activeTemplate)],
           index: 0,
           isDirty: false,
         };
+        const snap = snapshotTemplate(nextTemplate);
+
+        if (shouldCoalesce && entry.index > 0) {
+          const replacedStack = [...entry.stack.slice(0, entry.index), snap];
+          return {
+            ...prev,
+            [activeTemplate.id]: {
+              stack: replacedStack,
+              index: replacedStack.length - 1,
+              isDirty: true,
+              lastSavedAt: entry.lastSavedAt,
+            },
+          };
+        }
+
         const sliced = entry.stack.slice(0, entry.index + 1);
-        const nextStack = [...sliced, cloneTemplate(nextTemplate)].slice(-50);
+        const nextStack = [...sliced, snap].slice(-MAX_TEMPLATE_HISTORY);
         return {
           ...prev,
           [activeTemplate.id]: {
@@ -318,8 +384,9 @@ export default function App() {
   const handleUndo = useCallback(() => {
     const entry = historyMap[activeTemplate.id];
     if (!entry || entry.index <= 0) return;
+    lastTemplateEditMetaRef.current = null;
     const prevIndex = entry.index - 1;
-    const snapshot = cloneTemplate(entry.stack[prevIndex]);
+    const snapshot = snapshotTemplate(entry.stack[prevIndex]);
 
     setTemplates((prev) =>
       prev.map((item) => (item.id === activeTemplate.id ? snapshot : item))
@@ -339,8 +406,9 @@ export default function App() {
   const handleRedo = useCallback(() => {
     const entry = historyMap[activeTemplate.id];
     if (!entry || entry.index >= entry.stack.length - 1) return;
+    lastTemplateEditMetaRef.current = null;
     const nextIndex = entry.index + 1;
-    const snapshot = cloneTemplate(entry.stack[nextIndex]);
+    const snapshot = snapshotTemplate(entry.stack[nextIndex]);
 
     setTemplates((prev) =>
       prev.map((item) => (item.id === activeTemplate.id ? snapshot : item))
@@ -356,36 +424,80 @@ export default function App() {
     showToast('已重做下一步變更 (Redo)');
   }, [activeTemplate.id, historyMap, showToast]);
 
-  // Explicit Save Handler in DFM案例編輯頁
+  // Explicit Save Handler in DFM案例編輯頁 — verifies actual storage write before claiming success!
   const handleSaveTemplate = useCallback(() => {
-    try {
-      const nowTime = new Date().toLocaleTimeString('zh-TW', {
+    lastTemplateEditMetaRef.current = null;
+    setSaveStatus('saving');
+
+    const r1 = safeWriteStorage(STORAGE_KEYS.TEMPLATES, templates);
+    const r2 = safeWriteStorage(STORAGE_KEYS.SPECS, specs);
+    const r3 = safeWriteStorage(STORAGE_KEYS.DRAWINGS, drawings);
+
+    const failed = [r1, r2, r3].find((r) => !r.ok);
+    if (failed) {
+      setSaveStatus('error');
+      const msg =
+        failed.message ||
+        '儲存失敗：瀏覽器本機儲存空間已滿或受限，請先點選右上角「匯出 JSON」備份！';
+      setStorageWarning(msg);
+      showToast(msg, 'error');
+      return;
+    }
+
+    const nowTime =
+      r1.savedAt ||
+      new Date().toLocaleTimeString('zh-TW', {
         hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
       });
-      localStorage.setItem(STORAGE_KEY_TEMPLATES, JSON.stringify(templates));
-      localStorage.setItem(STORAGE_KEY_SPECS, JSON.stringify(specs));
-      localStorage.setItem(STORAGE_KEY_DRAWINGS, JSON.stringify(drawings));
-      setHistoryMap((prev) => {
-        const entry = prev[activeTemplate.id] || {
-          stack: [cloneTemplate(activeTemplate)],
-          index: 0,
-        };
-        return {
-          ...prev,
-          [activeTemplate.id]: {
-            ...entry,
-            isDirty: false,
-            lastSavedAt: nowTime,
-          },
-        };
-      });
-      showToast(`已成功儲存案例「${activeTemplate.code} - ${activeTemplate.title}」`);
-    } catch {
-      showToast('儲存失敗：瀏覽器儲存空間不足', 'error');
-    }
+
+    setSaveStatus('saved');
+    setStorageWarning(null);
+    setLastSavedAt(nowTime);
+
+    setHistoryMap((prev) => {
+      const entry = prev[activeTemplate.id] || {
+        stack: [snapshotTemplate(activeTemplate)],
+        index: 0,
+      };
+      return {
+        ...prev,
+        [activeTemplate.id]: {
+          ...entry,
+          isDirty: false,
+          lastSavedAt: nowTime,
+        },
+      };
+    });
+    showToast(
+      `已成功寫入本機儲存空間：「${activeTemplate.code} - ${activeTemplate.title}」`
+    );
   }, [activeTemplate, specs, templates, drawings, showToast]);
+
+  // Explicit Save Handler for DFM工程圖庫
+  const handleSaveDrawingsDirectly = useCallback(
+    (nextDrawings: DfmDrawingItem[]): boolean => {
+      setSaveStatus('saving');
+      const res = safeWriteStorage(STORAGE_KEYS.DRAWINGS, nextDrawings);
+      if (!res.ok) {
+        setSaveStatus('error');
+        const msg =
+          res.message ||
+          '儲存圖庫失敗：本機儲存空間不足，目前畫面圖面仍保留，請先點選「匯出 JSON」備份。';
+        setStorageWarning(msg);
+        showToast(msg, 'error');
+        return false;
+      }
+      setSaveStatus('saved');
+      setStorageWarning(null);
+      if (res.savedAt) {
+        setLastSavedAt(res.savedAt);
+      }
+      return true;
+    },
+    [showToast]
+  );
 
   // Keyboard shortcuts for Undo (Ctrl+Z), Redo (Ctrl+Y / Ctrl+Shift+Z), and Save (Ctrl+S) when on Editor Tab
   useEffect(() => {
@@ -471,12 +583,15 @@ export default function App() {
 
   const handleVariableChange = (varName: string, val: string) => {
     setActiveVariable(varName);
-    updateActiveTemplate({
-      variableDefaults: {
-        ...variableValues,
-        [varName]: val,
+    updateActiveTemplate(
+      {
+        variableDefaults: {
+          ...variableValues,
+          [varName]: val,
+        },
       },
-    });
+      true
+    );
   };
 
   const handleClearVariables = () => {
@@ -484,7 +599,7 @@ export default function App() {
     detectedVariables.forEach((v) => {
       cleared[v] = '';
     });
-    updateActiveTemplate({ variableDefaults: cleared });
+    updateActiveTemplate({ variableDefaults: cleared }, false);
     showToast('已清空目前項目的填空變數，可重新輸入實測值');
   };
 
@@ -493,16 +608,19 @@ export default function App() {
       (d) => d.id === activeTemplate.id || d.code === activeTemplate.code
     );
     if (defaultMatch) {
-      updateActiveTemplate({
-        variableDefaults: { ...defaultMatch.variableDefaults },
-      });
+      updateActiveTemplate(
+        {
+          variableDefaults: { ...defaultMatch.variableDefaults },
+        },
+        false
+      );
       showToast('已載入預設工程範例數值');
     } else {
       const filled: Record<string, string> = {};
       detectedVariables.forEach((v) => {
         filled[v] = variableValues[v] || `範例_${v}`;
       });
-      updateActiveTemplate({ variableDefaults: filled });
+      updateActiveTemplate({ variableDefaults: filled }, false);
       showToast('已自動填入範例數值');
     }
   };
@@ -516,7 +634,7 @@ export default function App() {
       updatedAt: new Date().toISOString().slice(0, 10),
     };
     setSpecs((prev) => [newSpec, ...prev]);
-    updateActiveTemplate({ referenceSpec: content });
+    updateActiveTemplate({ referenceSpec: content }, false);
     showToast(`已新增並儲存規範「${title}」`);
   };
 
@@ -538,11 +656,16 @@ export default function App() {
 
   // Apply a drawing from DFM工程圖庫 to the currently active DFM case
   const handleApplyDrawingToCase = (drawing: DfmDrawingItem) => {
-    updateActiveTemplate({
-      imageUrl: drawing.url,
-      imageCaption: drawing.description || drawing.name,
-      annotations: drawing.annotations ? [...drawing.annotations] : [],
-    });
+    updateActiveTemplate(
+      {
+        imageUrl: drawing.url,
+        imageCaption: drawing.description || drawing.name,
+        annotations: drawing.annotations
+          ? drawing.annotations.map((a) => ({ ...a }))
+          : [],
+      },
+      false
+    );
     showToast(
       `已將工程圖面「${drawing.name}」與圖片說明套用至案例「${activeTemplate.code}」`
     );
@@ -555,21 +678,27 @@ export default function App() {
     const token = `[${clean}]`;
 
     if (activeTextarea === 'issue') {
-      updateActiveTemplate({
-        issueTemplate: `${activeTemplate.issueTemplate}${token}`,
-        variableDefaults: {
-          ...variableValues,
-          [clean]: variableValues[clean] ?? '',
+      updateActiveTemplate(
+        {
+          issueTemplate: `${activeTemplate.issueTemplate}${token}`,
+          variableDefaults: {
+            ...variableValues,
+            [clean]: variableValues[clean] ?? '',
+          },
         },
-      });
+        false
+      );
     } else {
-      updateActiveTemplate({
-        recommendationTemplate: `${activeTemplate.recommendationTemplate}${token}`,
-        variableDefaults: {
-          ...variableValues,
-          [clean]: variableValues[clean] ?? '',
+      updateActiveTemplate(
+        {
+          recommendationTemplate: `${activeTemplate.recommendationTemplate}${token}`,
+          variableDefaults: {
+            ...variableValues,
+            [clean]: variableValues[clean] ?? '',
+          },
         },
-      });
+        false
+      );
     }
     setActiveVariable(clean);
     setCustomVarName('');
@@ -628,7 +757,9 @@ export default function App() {
       code: `${tpl.code}-COPY`,
       title: `${tpl.title} (副本)`,
       variableDefaults: { ...tpl.variableDefaults },
-      annotations: tpl.annotations ? [...tpl.annotations] : [],
+      annotations: tpl.annotations
+        ? tpl.annotations.map((a) => ({ ...a }))
+        : [],
       updatedAt: new Date().toISOString().slice(0, 10),
     };
     setTemplates((prev) => [duplicated, ...prev]);
@@ -652,36 +783,52 @@ export default function App() {
     showToast(`已刪除案例「${target?.code || ''}」`);
   };
 
-  // Export JSON
+  // Export JSON — displays file size, case count, and image count, and records backup time
   const handleExportJson = () => {
-    const payload = {
-      app: 'DFM Case Database Workbench',
-      version: '2.6.0',
-      exportedAt: new Date().toISOString(),
-      templates,
-      specs,
-      drawings,
-      reportBatch,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `dfm-database-backup-${new Date()
-      .toISOString()
-      .slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showToast(
-      `已匯出 ${templates.length} 組 DFM 案例、${drawings.length} 張工程圖面與 ${specs.length} 筆規範資料 (JSON)`
-    );
+    try {
+      const exportedIso = new Date().toISOString();
+      const payload = {
+        app: 'DFM Case Database Workbench',
+        version: '2.7.0',
+        exportedAt: exportedIso,
+        templates,
+        specs,
+        drawings,
+        reportBatch,
+      };
+      const jsonStr = JSON.stringify(payload, null, 2);
+      const blob = new Blob([jsonStr], {
+        type: 'application/json',
+      });
+      const fileSizeFormatted = formatBytes(blob.size);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `dfm-database-backup-${exportedIso.slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      const backupTimeDisplay = new Date().toLocaleString('zh-TW', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+      setLastBackupAt(backupTimeDisplay);
+      saveLastBackupTime(backupTimeDisplay);
+
+      showToast(
+        `已成功匯出備份檔（檔案大小：${fileSizeFormatted} · 案例：${templates.length} 筆 · 圖片：${storageMetrics.totalImageCount} 張 · 規範：${specs.length} 筆）`
+      );
+    } catch {
+      showToast('匯出 JSON 備份時發生錯誤，請再試一次', 'error');
+    }
   };
 
-  // Import JSON
+  // Step 1 of Import JSON: Validate without overwriting existing data, then open confirmation dialog
   const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -690,63 +837,87 @@ export default function App() {
     reader.onload = (event) => {
       try {
         const raw = event.target?.result;
-        if (typeof raw !== 'string') return;
-        const parsed = JSON.parse(raw);
-
-        const incomingTemplates: DfmTemplate[] = Array.isArray(parsed)
-          ? parsed
-          : Array.isArray(parsed.templates)
-          ? parsed.templates
-          : [];
-
-        if (incomingTemplates.length === 0) {
-          showToast('匯入失敗：JSON 檔案中未找到有效的 DFM 案例陣列', 'error');
+        if (typeof raw !== 'string') {
+          showToast('讀取 JSON 檔案內容失敗，未變更現有資料', 'error');
           return;
         }
 
-        const sanitized: DfmTemplate[] = incomingTemplates.map((item, idx) => ({
-          id: item.id || `imported-${Date.now()}-${idx}`,
-          code: item.code || `DFM-IMP-${idx + 1}`,
-          title: item.title || '未命名 DFM 項目',
-          category: DFM_CATEGORIES.includes(item.category)
-            ? item.category
-            : 'PCB Layout',
-          referenceModel: item.referenceModel || '',
-          issueTemplate: item.issueTemplate || '',
-          recommendationTemplate: item.recommendationTemplate || '',
-          referenceSpec: item.referenceSpec || '',
-          imageUrl: item.imageUrl || '',
-          imageCaption: item.imageCaption || '',
-          annotations: Array.isArray(item.annotations) ? item.annotations : [],
-          variableDefaults:
-            item.variableDefaults && typeof item.variableDefaults === 'object'
-              ? item.variableDefaults
-              : {},
-          updatedAt: item.updatedAt || new Date().toISOString().slice(0, 10),
-        }));
+        const validation = parseAndValidateBackupJson(
+          raw,
+          file.name,
+          file.size
+        );
 
-        setTemplates(sanitized);
-        setSelectedId(sanitized[0].id);
-        setHistoryMap({});
-        if (Array.isArray(parsed.specs) && parsed.specs.length > 0) {
-          setSpecs(parsed.specs);
+        if (!validation.isValid) {
+          showToast(
+            validation.errors[0] || '匯入失敗：JSON 檔案格式不符，已保留現有資料',
+            'error'
+          );
+          return;
         }
-        if (Array.isArray(parsed.drawings) && parsed.drawings.length > 0) {
-          setDrawings(parsed.drawings);
-        }
-        if (Array.isArray(parsed.reportBatch)) {
-          setReportBatch(parsed.reportBatch);
-        }
-        showToast(`成功匯入 ${sanitized.length} 組 DFM 案例資料！`);
+
+        // Open pre-import summary confirmation modal before touching state
+        setPendingImport(validation);
       } catch {
-        showToast('JSON 格式解析錯誤，請確認匯入檔案是否正確', 'error');
+        showToast('JSON 檔案解析異常，已完整保留現有資料', 'error');
       } finally {
         if (fileImportRef.current) {
           fileImportRef.current.value = '';
         }
       }
     };
+    reader.onerror = () => {
+      showToast('讀取檔案時發生錯誤，已保留原本資料', 'error');
+      if (fileImportRef.current) {
+        fileImportRef.current.value = '';
+      }
+    };
     reader.readAsText(file);
+  };
+
+  // Step 2 of Import JSON: Apply validated payload in Overwrite (Default) or Safe Merge mode
+  const handleConfirmImport = (mode: 'overwrite' | 'merge') => {
+    if (!pendingImport || !pendingImport.isValid) return;
+
+    if (mode === 'overwrite') {
+      // Default behavior: full overwrite
+      setTemplates(pendingImport.templates);
+      setSelectedId(pendingImport.templates[0].id);
+      setHistoryMap({});
+      if (pendingImport.specs && pendingImport.specs.length > 0) {
+        setSpecs(pendingImport.specs);
+      }
+      if (pendingImport.drawings && pendingImport.drawings.length > 0) {
+        setDrawings(pendingImport.drawings);
+      }
+      if (pendingImport.reportBatch) {
+        setReportBatch(pendingImport.reportBatch);
+      }
+      showToast(
+        `已完成整份覆蓋匯入：載入 ${pendingImport.summary.templateCount} 筆案例與 ${pendingImport.summary.totalImageCount} 張圖片！`
+      );
+    } else {
+      // Safe merge mode: keep existing data and merge incoming items
+      const mergedTemplates = mergeTemplatesSafely(
+        templates,
+        pendingImport.templates
+      );
+      setTemplates(mergedTemplates);
+      setHistoryMap({});
+      if (pendingImport.specs && pendingImport.specs.length > 0) {
+        setSpecs((prev) => mergeSpecsSafely(prev, pendingImport.specs!));
+      }
+      if (pendingImport.drawings && pendingImport.drawings.length > 0) {
+        setDrawings((prev) =>
+          mergeDrawingsSafely(prev, pendingImport.drawings!)
+        );
+      }
+      showToast(
+        `已完成安全合併匯入：目前共 ${mergedTemplates.length} 筆 DFM 案例！`
+      );
+    }
+
+    setPendingImport(null);
   };
 
   // Add current compiled item into Batch Report List
@@ -769,7 +940,9 @@ export default function App() {
       referenceSpec: activeTemplate.referenceSpec,
       imageUrl: activeTemplate.imageUrl,
       imageCaption: activeTemplate.imageCaption,
-      annotations: activeTemplate.annotations,
+      annotations: activeTemplate.annotations
+        ? activeTemplate.annotations.map((a) => ({ ...a }))
+        : [],
       variableValues: { ...variableValues },
       createdAt: new Date().toISOString(),
     };
@@ -777,23 +950,45 @@ export default function App() {
     showToast(`已將「${activeTemplate.code}」加入報告彙整清單`);
   };
 
+  // Memoized single-pass category counts for fast rendering with 100~1,000 templates
+  const templateCategoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (let i = 0; i < templates.length; i++) {
+      const cat = templates[i].category;
+      counts[cat] = (counts[cat] || 0) + 1;
+    }
+    return counts;
+  }, [templates]);
+
   // Filtered templates list
   const filteredTemplates = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
     return templates.filter((tpl) => {
       const matchCategory =
         selectedCategory === 'ALL' || tpl.category === selectedCategory;
-      const q = searchQuery.trim().toLowerCase();
-      if (!q) return matchCategory;
-      const matchQuery =
+      if (!matchCategory) return false;
+      if (!q) return true;
+      return (
         tpl.code.toLowerCase().includes(q) ||
         tpl.title.toLowerCase().includes(q) ||
         (tpl.referenceModel || '').toLowerCase().includes(q) ||
         tpl.issueTemplate.toLowerCase().includes(q) ||
         tpl.recommendationTemplate.toLowerCase().includes(q) ||
-        tpl.referenceSpec.toLowerCase().includes(q);
-      return matchCategory && matchQuery;
+        tpl.referenceSpec.toLowerCase().includes(q)
+      );
     });
   }, [templates, selectedCategory, searchQuery]);
+
+  // Paginated slice of filteredTemplates so DOM stays light even with 1,000 cases
+  const totalDbPages = Math.max(
+    1,
+    Math.ceil(filteredTemplates.length / dbPageSize)
+  );
+  const safeDbPage = Math.min(dbPage, totalDbPages);
+  const pagedTemplates = useMemo(() => {
+    const start = (safeDbPage - 1) * dbPageSize;
+    return filteredTemplates.slice(start, start + dbPageSize);
+  }, [filteredTemplates, safeDbPage, dbPageSize]);
 
   // Show Login Password Gate if not authenticated
   if (!isAuthenticated) {
@@ -802,31 +997,82 @@ export default function App() {
 
   return (
     <div className="min-h-screen w-full overflow-x-hidden flex flex-col bg-slate-50 text-slate-900">
-      {/* Top Header Bar: Brand Title + Lock/Logout */}
-      <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4">
-        <a
-          href="#top"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveTab('report');
-          }}
-          className="text-base sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
-        >
-          DFM案例資料庫工作台
-        </a>
+      {/* Top Header Bar: Brand Title + Storage/Backup Telemetry + Lock/Logout */}
+      <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <a
+            href="#top"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveTab('report');
+            }}
+            className="text-base sm:text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
+          >
+            DFM案例資料庫工作台
+          </a>
+        </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            clearDailySessionAuth();
-            setIsAuthenticated(false);
-          }}
-          title="鎖定工作台並返回密碼登入畫面"
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
-        >
-          <Lock className="w-3.5 h-3.5 text-slate-500" />
-          <span>登出鎖定</span>
-        </button>
+        {/* Right Header Status & Lock Controls */}
+        <div className="flex flex-wrap items-center gap-3 text-xs">
+          {/* Live Storage Status Indicator */}
+          <div className="hidden md:flex items-center gap-2 text-slate-600 font-mono tabular-nums">
+            <span
+              className={`inline-flex items-center gap-1 font-sans font-semibold ${
+                saveStatus === 'saved'
+                  ? 'text-emerald-700'
+                  : saveStatus === 'saving'
+                  ? 'text-amber-600'
+                  : 'text-red-600'
+              }`}
+            >
+              {saveStatus === 'saved' && (
+                <>
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>已儲存 ({lastSavedAt})</span>
+                </>
+              )}
+              {saveStatus === 'saving' && <span>儲存中...</span>}
+              {saveStatus === 'error' && (
+                <>
+                  <AlertCircle className="w-3.5 h-3.5 text-red-600" />
+                  <span>本機儲存失敗（請匯出備份）</span>
+                </>
+              )}
+            </span>
+            <span className="text-slate-300" aria-hidden="true">
+              |
+            </span>
+            <span
+              title="根據目前案例、圖庫與規範資料字元長度計算之 JSON 檔案大小估算值（非瀏覽器實際配額上限）"
+              className="flex items-center gap-1 text-slate-600"
+            >
+              <HardDrive className="w-3.5 h-3.5 text-slate-400" />
+              <span>資料估算：約 {storageMetrics.formattedJsonSize}</span>
+            </span>
+            <span className="text-slate-300" aria-hidden="true">
+              |
+            </span>
+            <span className="flex items-center gap-1 text-slate-500 font-sans">
+              <Clock className="w-3.5 h-3.5 text-slate-400" />
+              <span>
+                最近備份：{lastBackupAt ? lastBackupAt : '尚未匯出備份'}
+              </span>
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              clearDailySessionAuth();
+              setIsAuthenticated(false);
+            }}
+            title="鎖定工作台並返回密碼登入畫面"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+          >
+            <Lock className="w-3.5 h-3.5 text-slate-500" />
+            <span>登出鎖定</span>
+          </button>
+        </div>
       </header>
 
       {/* Sub-Header Bar: 4-Tab Segmented Switcher on Left (DFM工程圖庫 on right of DFM案例) + [匯出 JSON | 匯入 JSON] on Right */}
@@ -916,7 +1162,43 @@ export default function App() {
         </div>
       </section>
 
-      {/* Notification Banner */}
+      {/* Persistent Storage Warning Banner (When localStorage quota or security error occurs) */}
+      {storageWarning && (
+        <div className="max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 rounded-xl border border-red-300 bg-red-50 text-xs text-red-950 shadow-2xs">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+              <div className="space-y-0.5">
+                <div className="font-bold text-red-900">
+                  本機儲存空間寫入警告（目前畫面資料仍安全保留於記憶體中）
+                </div>
+                <div className="text-red-800 leading-relaxed">
+                  {storageWarning}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleExportJson}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 transition-colors"
+              >
+                <Download className="w-3.5 h-3.5" />
+                立即匯出 JSON 備份
+              </button>
+              <button
+                type="button"
+                onClick={() => setStorageWarning(null)}
+                className="px-2.5 py-1.5 text-xs text-red-700 hover:bg-red-100 rounded-lg"
+              >
+                暫時關閉
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification Banner */}
       {statusBanner && (
         <div className="max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-4">
           <div
@@ -948,7 +1230,7 @@ export default function App() {
       {/* MAIN CONTENT VIEWPORT */}
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-5">
         {/* =====================================================================
-            TAB 1: DFM案例資料庫列表
+            TAB 1: DFM案例資料庫列表 (Optimized with Pagination for 100~1,000 cases)
         ===================================================================== */}
         {activeTab === 'database' && (
           <div className="space-y-5">
@@ -999,7 +1281,7 @@ export default function App() {
                   全部製程 ({templates.length})
                 </button>
                 {DFM_CATEGORIES.map((cat) => {
-                  const count = templates.filter((t) => t.category === cat).length;
+                  const count = templateCategoryCounts[cat] || 0;
                   return (
                     <button
                       key={cat}
@@ -1035,109 +1317,174 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {filteredTemplates.map((tpl) => {
-                  const isSelected = tpl.id === activeTemplate.id;
-                  const vars = extractVariables(
-                    tpl.issueTemplate,
-                    tpl.recommendationTemplate
-                  );
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {pagedTemplates.map((tpl) => {
+                    const isSelected = tpl.id === activeTemplate.id;
+                    const vars = extractVariables(
+                      tpl.issueTemplate,
+                      tpl.recommendationTemplate
+                    );
 
-                  return (
-                    <div
-                      key={tpl.id}
-                      onClick={() => setSelectedId(tpl.id)}
-                      className={`p-5 rounded-2xl border transition-colors cursor-pointer flex flex-col justify-between gap-4 ${
-                        isSelected
-                          ? 'bg-blue-50/40 border-blue-600'
-                          : 'bg-white border-slate-200 hover:border-slate-300'
-                      }`}
-                    >
-                      <div className="space-y-2.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono tabular-nums">
-                            <span className="font-bold text-slate-900">
-                              {tpl.code}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span className="font-sans font-semibold text-blue-700">
-                              {tpl.category}
-                            </span>
-                            <span aria-hidden="true">·</span>
-                            <span>{vars.length} 個填空變數</span>
+                    return (
+                      <div
+                        key={tpl.id}
+                        onClick={() => setSelectedId(tpl.id)}
+                        className={`p-5 rounded-2xl border transition-colors cursor-pointer flex flex-col justify-between gap-4 ${
+                          isSelected
+                            ? 'bg-blue-50/40 border-blue-600'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <div className="space-y-2.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-mono tabular-nums">
+                              <span className="font-bold text-slate-900">
+                                {tpl.code}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-sans font-semibold text-blue-700">
+                                {tpl.category}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span>{vars.length} 個填空變數</span>
+                            </div>
+
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => handleDuplicateTemplate(tpl, e)}
+                                title="複製此案例副本"
+                                className="p-1.5 text-slate-400 hover:text-blue-600 rounded-md hover:bg-slate-100 transition-colors"
+                              >
+                                <DuplicateIcon className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => handleDeleteTemplate(tpl.id, e)}
+                                title="刪除此案例"
+                                className="p-1.5 text-slate-400 hover:text-red-600 rounded-md hover:bg-slate-100 transition-colors"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
                           </div>
 
-                          <div className="flex items-center gap-1 shrink-0">
+                          <h3 className="text-sm sm:text-base font-bold text-slate-900 leading-snug">
+                            {tpl.title}
+                          </h3>
+
+                          <div className="text-xs text-slate-600 font-mono">
+                            參考機種：{tpl.referenceModel || '未填寫'}
+                          </div>
+
+                          <p className="text-xs text-slate-600 leading-relaxed line-clamp-2">
+                            <strong className="text-slate-800">問題點範本：</strong>
+                            {tpl.issueTemplate}
+                          </p>
+                        </div>
+
+                        <div className="pt-3 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                            更新於 {tpl.updatedAt}
+                          </span>
+
+                          <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={(e) => handleDuplicateTemplate(tpl, e)}
-                              title="複製此案例副本"
-                              className="p-1.5 text-slate-400 hover:text-blue-600 rounded-md hover:bg-slate-100 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedId(tpl.id);
+                                setActiveTab('editor');
+                              }}
+                              className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
                             >
-                              <DuplicateIcon className="w-4 h-4" />
+                              <FileEdit className="w-3.5 h-3.5" />
+                              DFM案例編輯頁
                             </button>
+
                             <button
                               type="button"
-                              onClick={(e) => handleDeleteTemplate(tpl.id, e)}
-                              title="刪除此案例"
-                              className="p-1.5 text-slate-400 hover:text-red-600 rounded-md hover:bg-slate-100 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedId(tpl.id);
+                                setActiveTab('report');
+                              }}
+                              className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <span>查看 DFM案例</span>
+                              <ArrowRight className="w-3.5 h-3.5" />
                             </button>
                           </div>
                         </div>
-
-                        <h3 className="text-sm sm:text-base font-bold text-slate-900 leading-snug">
-                          {tpl.title}
-                        </h3>
-
-                        <div className="text-xs text-slate-600 font-mono">
-                          參考機種：{tpl.referenceModel || '未填寫'}
-                        </div>
-
-                        <p className="text-xs text-slate-600 leading-relaxed line-clamp-2">
-                          <strong className="text-slate-800">問題點範本：</strong>
-                          {tpl.issueTemplate}
-                        </p>
                       </div>
+                    );
+                  })}
+                </div>
 
-                      <div className="pt-3 border-t border-slate-200/80 flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-[11px] text-slate-400 font-mono tabular-nums">
-                          更新於 {tpl.updatedAt}
-                        </span>
-
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedId(tpl.id);
-                              setActiveTab('editor');
-                            }}
-                            className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <FileEdit className="w-3.5 h-3.5" />
-                            DFM案例編輯頁
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedId(tpl.id);
-                              setActiveTab('report');
-                            }}
-                            className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <span>查看 DFM案例</span>
-                            <ArrowRight className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
+                {/* Pagination Bar for 100~1,000 Cases */}
+                {filteredTemplates.length > 12 && (
+                  <div className="bg-white border border-slate-200 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 shadow-2xs">
+                    <div className="flex items-center gap-2 font-mono tabular-nums">
+                      <span>
+                        顯示第 {(safeDbPage - 1) * dbPageSize + 1}–
+                        {Math.min(
+                          safeDbPage * dbPageSize,
+                          filteredTemplates.length
+                        )}{' '}
+                        筆（共篩選出 {filteredTemplates.length} 筆案例）
+                      </span>
                     </div>
-                  );
-                })}
-              </div>
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-slate-500">每頁顯示：</span>
+                        <select
+                          value={dbPageSize}
+                          onChange={(e) =>
+                            setDbPageSize(Number(e.target.value))
+                          }
+                          className="px-2 py-1 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-none focus:border-blue-600 font-mono"
+                        >
+                          <option value={24}>24 筆</option>
+                          <option value={48}>48 筆</option>
+                          <option value={96}>96 筆</option>
+                        </select>
+                      </div>
+
+                      {totalDbPages > 1 && (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={safeDbPage <= 1}
+                            onClick={() =>
+                              setDbPage((p) => Math.max(1, p - 1))
+                            }
+                            className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40"
+                          >
+                            <ChevronLeft className="w-4 h-4" />
+                          </button>
+                          <span className="px-2 font-mono tabular-nums">
+                            第 {safeDbPage} / {totalDbPages} 頁
+                          </span>
+                          <button
+                            type="button"
+                            disabled={safeDbPage >= totalDbPages}
+                            onClick={() =>
+                              setDbPage((p) =>
+                                Math.min(totalDbPages, p + 1)
+                              )
+                            }
+                            className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40"
+                          >
+                            <ChevronRight className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -1157,12 +1504,16 @@ export default function App() {
                   <span aria-hidden="true">·</span>
                   <span
                     className={
-                      isDirty
+                      saveStatus === 'error'
+                        ? 'text-red-600 font-sans font-semibold'
+                        : isDirty
                         ? 'text-amber-600 font-sans font-semibold'
                         : 'text-emerald-600 font-sans font-medium'
                     }
                   >
-                    {isDirty
+                    {saveStatus === 'error'
+                      ? '本機儲存失敗（請匯出 JSON 備份）'
+                      : isDirty
                       ? '尚有未確認儲存之編輯'
                       : `已儲存 (${currentHistory?.lastSavedAt || activeTemplate.updatedAt})`}
                   </span>
@@ -1252,7 +1603,7 @@ export default function App() {
                       type="text"
                       value={activeTemplate.code}
                       onChange={(e) =>
-                        updateActiveTemplate({ code: e.target.value })
+                        updateActiveTemplate({ code: e.target.value }, true)
                       }
                       className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:border-blue-600"
                     />
@@ -1264,9 +1615,12 @@ export default function App() {
                     <select
                       value={activeTemplate.category}
                       onChange={(e) =>
-                        updateActiveTemplate({
-                          category: e.target.value as DfmCategory,
-                        })
+                        updateActiveTemplate(
+                          {
+                            category: e.target.value as DfmCategory,
+                          },
+                          false
+                        )
                       }
                       className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:border-blue-600"
                     >
@@ -1285,9 +1639,12 @@ export default function App() {
                       type="text"
                       value={activeTemplate.referenceModel || ''}
                       onChange={(e) =>
-                        updateActiveTemplate({
-                          referenceModel: e.target.value,
-                        })
+                        updateActiveTemplate(
+                          {
+                            referenceModel: e.target.value,
+                          },
+                          true
+                        )
                       }
                       placeholder="例如：PWR-2400W-RevA"
                       className="w-full px-3 py-2 text-xs font-mono bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:border-blue-600"
@@ -1303,7 +1660,7 @@ export default function App() {
                     type="text"
                     value={activeTemplate.title}
                     onChange={(e) =>
-                      updateActiveTemplate({ title: e.target.value })
+                      updateActiveTemplate({ title: e.target.value }, true)
                     }
                     placeholder="例如：併板 V-Cut 板邊零件安全間距不足"
                     className="w-full px-3 py-2.5 text-xs sm:text-sm font-medium bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:border-blue-600"
@@ -1390,7 +1747,10 @@ export default function App() {
                     }}
                     value={activeTemplate.issueTemplate}
                     onChange={(e) =>
-                      updateActiveTemplate({ issueTemplate: e.target.value })
+                      updateActiveTemplate(
+                        { issueTemplate: e.target.value },
+                        true
+                      )
                     }
                     placeholder="輸入固定問題描述，並以 [零件編號]、[距離數值] 標記動態填空位置..."
                     className="w-full p-3 text-xs sm:text-sm leading-relaxed bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-blue-600"
@@ -1465,9 +1825,12 @@ export default function App() {
                     }}
                     value={activeTemplate.recommendationTemplate}
                     onChange={(e) =>
-                      updateActiveTemplate({
-                        recommendationTemplate: e.target.value,
-                      })
+                      updateActiveTemplate(
+                        {
+                          recommendationTemplate: e.target.value,
+                        },
+                        true
+                      )
                     }
                     placeholder="輸入具體改善建議，例如：請將零件 [零件編號] 往 [方向] 平移至少 [建議內縮距離]..."
                     className="w-full p-3 text-xs sm:text-sm leading-relaxed bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-blue-600"
@@ -1522,13 +1885,13 @@ export default function App() {
                     annotations={activeTemplate.annotations || []}
                     drawings={drawings}
                     onChangeImage={(url) =>
-                      updateActiveTemplate({ imageUrl: url })
+                      updateActiveTemplate({ imageUrl: url }, false)
                     }
                     onChangeCaption={(caption) =>
-                      updateActiveTemplate({ imageCaption: caption })
+                      updateActiveTemplate({ imageCaption: caption }, true)
                     }
                     onChangeAnnotations={(annotations) =>
-                      updateActiveTemplate({ annotations })
+                      updateActiveTemplate({ annotations }, false)
                     }
                     onApplyDrawing={handleApplyDrawingToCase}
                     onOpenDrawingGallery={() => setActiveTab('gallery')}
@@ -1539,7 +1902,7 @@ export default function App() {
                   <SpecDatabaseManager
                     currentSpecText={activeTemplate.referenceSpec}
                     onChangeSpecText={(newText) =>
-                      updateActiveTemplate({ referenceSpec: newText })
+                      updateActiveTemplate({ referenceSpec: newText }, true)
                     }
                     specs={specs}
                     onAddSpec={handleAddSpec}
@@ -1559,7 +1922,7 @@ export default function App() {
               onSelectVariable={setActiveVariable}
               onChangeVariable={handleVariableChange}
               onChangeReferenceModel={(val) =>
-                updateActiveTemplate({ referenceModel: val })
+                updateActiveTemplate({ referenceModel: val }, true)
               }
               onRestoreSample={handleRestoreSampleVariables}
               onClearVariables={handleClearVariables}
@@ -1603,7 +1966,7 @@ export default function App() {
               onSelectVariable={setActiveVariable}
               onChangeVariable={handleVariableChange}
               onChangeReferenceModel={(val) =>
-                updateActiveTemplate({ referenceModel: val })
+                updateActiveTemplate({ referenceModel: val }, true)
               }
               onRestoreSample={handleRestoreSampleVariables}
               onClearVariables={handleClearVariables}
@@ -1621,6 +1984,7 @@ export default function App() {
           <DfmDrawingGallery
             drawings={drawings}
             onChangeDrawings={setDrawings}
+            onSaveDrawingsToStorage={handleSaveDrawingsDirectly}
             onApplyToCurrentCase={(drawing) => {
               handleApplyDrawingToCase(drawing);
               setActiveTab('report');
@@ -1630,14 +1994,158 @@ export default function App() {
         )}
       </main>
 
-      {/* Quiet Functional Footer */}
-      <footer className="mt-auto border-t border-slate-200 bg-white px-4 sm:px-6 py-3.5">
-        <div className="max-w-[1440px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <div>
-            DFM案例資料庫工作台 · 支援動態變數雙向點選連動與本機自動儲存
+      {/* Pre-Import JSON Verification & Confirmation Modal */}
+      {pendingImport && (
+        <div
+          onClick={() => setPendingImport(null)}
+          className="fixed inset-0 z-50 bg-slate-950/75 flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-lg w-full bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden"
+          >
+            <div className="px-5 py-4 bg-slate-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <FileCheck2 className="w-5 h-5 text-emerald-400" />
+                <span className="text-sm font-bold">
+                  匯入 JSON 備份檔案確認
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingImport(null)}
+                className="p-1 text-slate-300 hover:text-white rounded-lg"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-xs text-slate-700">
+              <p className="leading-relaxed">
+                檔案已通過格式驗證。為保護您現有的工作台資料，請先確認以下摘要資訊，再選擇匯入方式：
+              </p>
+
+              <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2 font-mono">
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">檔案名稱：</span>
+                  <span className="font-semibold text-slate-900 truncate max-w-[260px]">
+                    {pendingImport.summary.fileName}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">檔案大小：</span>
+                  <span className="font-semibold text-slate-900">
+                    {pendingImport.summary.formattedFileSize}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">DFM 案例數量：</span>
+                  <span className="font-bold text-blue-700">
+                    {pendingImport.summary.templateCount} 筆
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">內含圖片數量：</span>
+                  <span className="font-bold text-emerald-700">
+                    {pendingImport.summary.totalImageCount} 張
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">
+                    工程圖庫 / 常用規範：
+                  </span>
+                  <span className="text-slate-800">
+                    圖庫 {pendingImport.summary.drawingCount} 張 · 規範{' '}
+                    {pendingImport.summary.specCount} 筆
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 font-sans">格式版本：</span>
+                  <span className="text-slate-600">
+                    {pendingImport.summary.version}
+                  </span>
+                </div>
+              </div>
+
+              {pendingImport.warnings.length > 0 && (
+                <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl space-y-1 text-amber-900">
+                  <div className="font-bold">相容性轉換提醒：</div>
+                  <ul className="list-disc pl-4 space-y-0.5">
+                    {pendingImport.warnings.slice(0, 3).map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div className="space-y-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => handleConfirmImport('overwrite')}
+                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl shadow-2xs flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>確認匯入（整份覆蓋目前資料 — 預設）</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleConfirmImport('merge')}
+                  className="w-full py-2 px-4 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Layers className="w-4 h-4 text-emerald-700" />
+                  <span>安全合併匯入（保留現有資料並合併新項目）</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPendingImport(null)}
+                  className="w-full py-2 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl transition-colors"
+                >
+                  取消匯入（保留原本資料）
+                </button>
+              </div>
+            </div>
           </div>
-          <div className="font-mono tabular-nums">
-            案例數：{templates.length} 筆 · 工程圖庫：{drawings.length} 張 · 常用規範庫：{specs.length} 筆 · 報告清單：{reportBatch.length} 筆
+        </div>
+      )}
+
+      {/* Functional Footer with Storage Capacity, Image Count, Save Status & Backup Time */}
+      <footer className="mt-auto border-t border-slate-200 bg-white px-4 sm:px-6 py-3.5">
+        <div className="max-w-[1440px] mx-auto flex flex-col lg:flex-row items-center justify-between gap-2 text-xs text-slate-500">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-semibold text-slate-700">
+              DFM案例資料庫工作台
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              儲存狀態：
+              {saveStatus === 'saved'
+                ? `儲存成功 (${lastSavedAt})`
+                : saveStatus === 'saving'
+                ? '儲存中...'
+                : '儲存失敗（請匯出備份）'}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              最近匯出備份：{lastBackupAt ? lastBackupAt : '尚未匯出備份'}
+            </span>
+          </div>
+
+          <div className="font-mono tabular-nums flex flex-wrap items-center gap-2">
+            <span>案例：{templates.length} 筆</span>
+            <span aria-hidden="true">·</span>
+            <span>圖片總數：{storageMetrics.totalImageCount} 張</span>
+            <span aria-hidden="true">·</span>
+            <span>工程圖庫：{drawings.length} 張</span>
+            <span aria-hidden="true">·</span>
+            <span>規範庫：{specs.length} 筆</span>
+            <span aria-hidden="true">·</span>
+            <span>報告清單：{reportBatch.length} 筆</span>
+            <span aria-hidden="true">·</span>
+            <span title="此數值為資料序列化後之 JSON 大小估算值，並非瀏覽器實際剩餘空間">
+              JSON 大小估算：約 {storageMetrics.formattedJsonSize}
+            </span>
           </div>
         </div>
       </footer>

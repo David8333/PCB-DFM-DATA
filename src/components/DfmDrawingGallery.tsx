@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Plus,
   Upload,
@@ -15,24 +15,51 @@ import {
   X,
   Image as ImageIcon,
   ArrowUpRight,
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import { DfmDrawingItem, DfmCategory, ImageAnnotation } from '../types/dfm';
 import { DFM_CATEGORIES } from '../data/defaultTemplates';
+import {
+  processUploadedImageFile,
+  estimateDataUrlBytes,
+} from '../utils/imageProcessor';
+import { formatBytes } from '../utils/storageManager';
 
 interface DfmDrawingGalleryProps {
   drawings: DfmDrawingItem[];
   onChangeDrawings: (nextDrawings: DfmDrawingItem[]) => void;
+  onSaveDrawingsToStorage?: (nextDrawings: DfmDrawingItem[]) => boolean;
   onApplyToCurrentCase: (drawing: DfmDrawingItem) => void;
   onShowToast: (msg: string, type?: 'success' | 'error') => void;
 }
 
-function cloneDrawings(list: DfmDrawingItem[]): DfmDrawingItem[] {
-  return JSON.parse(JSON.stringify(list));
+const MAX_GALLERY_HISTORY = 25;
+const GALLERY_PAGE_SIZE = 20;
+
+/**
+ * Structural-sharing snapshot helper:
+ * Clones item metadata and annotations array WITHOUT running JSON.parse(JSON.stringify(...))
+ * so immutable Base64 image strings (`item.url`) share memory references across Undo/Redo snapshots.
+ */
+function shallowCloneDrawingItem(item: DfmDrawingItem): DfmDrawingItem {
+  return {
+    ...item,
+    annotations: item.annotations
+      ? item.annotations.map((pin) => ({ ...pin }))
+      : [],
+  };
+}
+
+function createDrawingsSnapshot(list: DfmDrawingItem[]): DfmDrawingItem[] {
+  return list.map(shallowCloneDrawingItem);
 }
 
 export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
   drawings,
   onChangeDrawings,
+  onSaveDrawingsToStorage,
   onApplyToCurrentCase,
   onShowToast,
 }) => {
@@ -41,23 +68,35 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
   );
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
+  const [currentPage, setCurrentPage] = useState(1);
   const [inputMode, setInputMode] = useState<'upload' | 'url'>('upload');
   const [annotateMode, setAnnotateMode] = useState(false);
   const [newPinLabel, setNewPinLabel] = useState('不良位置標註');
   const [isZoomed, setIsZoomed] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [compressionBanner, setCompressionBanner] = useState<string | null>(
+    null
+  );
 
-  // Undo / Redo / Save History Stack for the Drawing Gallery
+  // Structural-sharing Undo / Redo History Stack for the Drawing Gallery
   const [history, setHistory] = useState<{
     stack: DfmDrawingItem[][];
     index: number;
     isDirty: boolean;
     lastSavedAt: string;
   }>(() => ({
-    stack: [cloneDrawings(drawings)],
+    stack: [createDrawingsSnapshot(drawings)],
     index: 0,
     isDirty: false,
     lastSavedAt: new Date().toISOString().slice(0, 10),
   }));
+
+  // Track last text edit timestamp & drawingId to coalesce rapid typing into one Undo step
+  const lastTextEditMetaRef = useRef<{
+    drawingId: string;
+    field: string;
+    timestamp: number;
+  } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const replaceFileInputRef = useRef<HTMLInputElement>(null);
@@ -73,19 +112,63 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
     }
   }, [drawings, selectedDrawingId]);
 
-  const activeDrawing =
-    drawings.find((d) => d.id === selectedDrawingId) || drawings[0] || null;
+  // Reset pagination to page 1 when search or category filter changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, selectedCategory]);
+
+  const activeDrawing = useMemo(
+    () =>
+      drawings.find((d) => d.id === selectedDrawingId) || drawings[0] || null,
+    [drawings, selectedDrawingId]
+  );
 
   const canUndo = history.index > 0;
   const canRedo = history.index < history.stack.length - 1;
 
-  // Push a new drawings state into history and update parent
+  // Commit drawings change with optional coalescing for rapid text typing
   const commitDrawingsChange = useCallback(
-    (nextDrawings: DfmDrawingItem[]) => {
+    (
+      nextDrawings: DfmDrawingItem[],
+      coalesceKey?: { drawingId: string; field: string }
+    ) => {
       onChangeDrawings(nextDrawings);
+
+      const now = Date.now();
+      const prevMeta = lastTextEditMetaRef.current;
+      const shouldCoalesce =
+        Boolean(
+          coalesceKey &&
+            prevMeta &&
+            prevMeta.drawingId === coalesceKey.drawingId &&
+            prevMeta.field === coalesceKey.field &&
+            now - prevMeta.timestamp < 700
+        );
+
+      if (coalesceKey) {
+        lastTextEditMetaRef.current = {
+          drawingId: coalesceKey.drawingId,
+          field: coalesceKey.field,
+          timestamp: now,
+        };
+      } else {
+        lastTextEditMetaRef.current = null;
+      }
+
       setHistory((prev) => {
+        const snapshot = createDrawingsSnapshot(nextDrawings);
+        if (shouldCoalesce && prev.index > 0) {
+          const updatedStack = [...prev.stack.slice(0, prev.index), snapshot];
+          return {
+            ...prev,
+            stack: updatedStack,
+            index: updatedStack.length - 1,
+            isDirty: true,
+          };
+        }
+
         const sliced = prev.stack.slice(0, prev.index + 1);
-        const nextStack = [...sliced, cloneDrawings(nextDrawings)].slice(-40);
+        const nextStack = [...sliced, snapshot].slice(-MAX_GALLERY_HISTORY);
         return {
           ...prev,
           stack: nextStack,
@@ -99,7 +182,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
 
   // Update the currently selected drawing item
   const updateActiveDrawing = useCallback(
-    (patch: Partial<DfmDrawingItem>) => {
+    (patch: Partial<DfmDrawingItem>, coalesceField?: string) => {
       if (!activeDrawing) return;
       const today = new Date().toISOString().slice(0, 10);
       const nextList = drawings.map((item) =>
@@ -107,7 +190,12 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
           ? { ...item, ...patch, updatedAt: today }
           : item
       );
-      commitDrawingsChange(nextList);
+      commitDrawingsChange(
+        nextList,
+        coalesceField
+          ? { drawingId: activeDrawing.id, field: coalesceField }
+          : undefined
+      );
     },
     [activeDrawing, drawings, commitDrawingsChange]
   );
@@ -115,8 +203,9 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
   // Undo handler
   const handleUndo = useCallback(() => {
     if (history.index <= 0) return;
+    lastTextEditMetaRef.current = null;
     const targetIndex = history.index - 1;
-    const restored = cloneDrawings(history.stack[targetIndex]);
+    const restored = createDrawingsSnapshot(history.stack[targetIndex]);
     onChangeDrawings(restored);
     setHistory((prev) => ({
       ...prev,
@@ -129,8 +218,9 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
   // Redo handler
   const handleRedo = useCallback(() => {
     if (history.index >= history.stack.length - 1) return;
+    lastTextEditMetaRef.current = null;
     const targetIndex = history.index + 1;
-    const restored = cloneDrawings(history.stack[targetIndex]);
+    const restored = createDrawingsSnapshot(history.stack[targetIndex]);
     onChangeDrawings(restored);
     setHistory((prev) => ({
       ...prev,
@@ -140,19 +230,29 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
     onShowToast('已重做工程圖庫下一步變更 (Redo)');
   }, [history, onChangeDrawings, onShowToast]);
 
-  // Save handler
+  // Save handler — verifies actual storage write before marking saved
   const handleSaveGallery = useCallback(() => {
+    lastTextEditMetaRef.current = null;
+    const nextCopy = [...drawings];
+    onChangeDrawings(nextCopy);
+
+    if (onSaveDrawingsToStorage) {
+      const ok = onSaveDrawingsToStorage(nextCopy);
+      if (!ok) {
+        return;
+      }
+    }
+
     const nowTime = new Date().toTimeString().slice(0, 8);
-    onChangeDrawings([...drawings]);
     setHistory((prev) => ({
       ...prev,
       isDirty: false,
       lastSavedAt: nowTime,
     }));
     onShowToast(
-      `已儲存 DFM工程圖庫（共 ${drawings.length} 張工程圖面與圖片說明）`
+      `已實際寫入並儲存 DFM工程圖庫（共 ${drawings.length} 張工程圖面與圖片說明）`
     );
-  }, [drawings, onChangeDrawings, onShowToast]);
+  }, [drawings, onChangeDrawings, onSaveDrawingsToStorage, onShowToast]);
 
   // Keyboard shortcuts (Ctrl+Z / Ctrl+Y / Ctrl+S) inside DFM工程圖庫
   useEffect(() => {
@@ -175,54 +275,51 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSaveGallery, handleUndo, handleRedo]);
 
-  // Compress uploaded image and either create new item or update active item
-  const processImageFile = (
-    file: File,
-    mode: 'new' | 'replace'
-  ) => {
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const maxW = 1080;
-        const scale = img.width > maxW ? maxW / img.width : 1;
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.86);
-        const cleanFileName = file.name.replace(/\.[^/.]+$/, '');
-        const today = new Date().toISOString().slice(0, 10);
+  // Compress uploaded image using unified imageProcessor
+  const processImageFile = async (file: File, mode: 'new' | 'replace') => {
+    setIsUploading(true);
+    try {
+      const result = await processUploadedImageFile(file, {
+        maxWidth: 1080,
+        maxHeight: 1080,
+        quality: 0.85,
+      });
 
-        if (mode === 'new') {
-          const newItem: DfmDrawingItem = {
-            id: `drawing-${Date.now()}`,
-            name: cleanFileName || `新建工程圖面 #${drawings.length + 1}`,
-            category:
-              selectedCategory !== 'ALL'
-                ? (selectedCategory as DfmCategory)
-                : 'PCB Layout',
-            url: dataUrl,
-            description: `圖示：${cleanFileName}（請在此編寫圖片說明與 DFM 判讀重點）`,
-            annotations: [],
-            updatedAt: today,
-          };
-          const nextList = [newItem, ...drawings];
-          commitDrawingsChange(nextList);
-          setSelectedDrawingId(newItem.id);
-          onShowToast(`已上傳並新增工程圖面「${newItem.name}」`);
-        } else if (activeDrawing) {
-          updateActiveDrawing({ url: dataUrl });
-          onShowToast(`已更新「${activeDrawing.name}」的圖片檔案`);
-        }
-      };
-      if (typeof event.target?.result === 'string') {
-        img.src = event.target.result;
+      if (!result.ok) {
+        onShowToast(result.error || '圖片上傳處理失敗', 'error');
+        return;
       }
-    };
-    reader.readAsDataURL(file);
+
+      setCompressionBanner(result.summaryText);
+      const cleanFileName = file.name.replace(/\.[^/.]+$/, '');
+      const today = new Date().toISOString().slice(0, 10);
+
+      if (mode === 'new') {
+        const newItem: DfmDrawingItem = {
+          id: `drawing-${Date.now()}`,
+          name: cleanFileName || `新建工程圖面 #${drawings.length + 1}`,
+          category:
+            selectedCategory !== 'ALL'
+              ? (selectedCategory as DfmCategory)
+              : 'PCB Layout',
+          url: result.dataUrl,
+          description: `圖示：${cleanFileName}（請在此編寫圖片說明與 DFM 判讀重點）`,
+          annotations: [],
+          updatedAt: today,
+        };
+        const nextList = [newItem, ...drawings];
+        commitDrawingsChange(nextList);
+        setSelectedDrawingId(newItem.id);
+        onShowToast(`已上傳並新增工程圖面「${newItem.name}」（${result.summaryText}）`);
+      } else if (activeDrawing) {
+        updateActiveDrawing({ url: result.dataUrl });
+        onShowToast(`已更新「${activeDrawing.name}」圖檔（${result.summaryText}）`);
+      }
+    } catch {
+      onShowToast('圖片處理過程發生錯誤，請確認圖片格式是否正確', 'error');
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   // Create a blank/template drawing item
@@ -254,7 +351,9 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
       ...item,
       id: `drawing-${Date.now()}`,
       name: `${item.name} (副本)`,
-      annotations: item.annotations ? [...item.annotations] : [],
+      annotations: item.annotations
+        ? item.annotations.map((a) => ({ ...a }))
+        : [],
       updatedAt: today,
     };
     const nextList = [dup, ...drawings];
@@ -283,6 +382,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
   const handleCanvasClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!annotateMode || !imageContainerRef.current || !activeDrawing) return;
     const rect = imageContainerRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     const x = Math.round(((e.clientX - rect.left) / rect.width) * 100);
     const y = Math.round(((e.clientY - rect.top) / rect.height) * 100);
     const currentPins = activeDrawing.annotations || [];
@@ -304,19 +404,46 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
     });
   };
 
-  // Filter drawings
-  const filteredDrawings = drawings.filter((d) => {
-    const matchCategory =
-      selectedCategory === 'ALL' || d.category === selectedCategory;
+  // Category counts memoized
+  const categoryCountMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (let i = 0; i < drawings.length; i++) {
+      const cat = drawings[i].category;
+      map[cat] = (map[cat] || 0) + 1;
+    }
+    return map;
+  }, [drawings]);
+
+  // Filter drawings memoized
+  const filteredDrawings = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return matchCategory;
-    return (
-      matchCategory &&
-      (d.name.toLowerCase().includes(q) ||
+    return drawings.filter((d) => {
+      const matchCategory =
+        selectedCategory === 'ALL' || d.category === selectedCategory;
+      if (!matchCategory) return false;
+      if (!q) return true;
+      return (
+        d.name.toLowerCase().includes(q) ||
         (d.description || '').toLowerCase().includes(q) ||
-        d.category.toLowerCase().includes(q))
-    );
-  });
+        d.category.toLowerCase().includes(q)
+      );
+    });
+  }, [drawings, selectedCategory, searchQuery]);
+
+  const totalPages = Math.max(
+    1,
+    Math.ceil(filteredDrawings.length / GALLERY_PAGE_SIZE)
+  );
+  const safePage = Math.min(currentPage, totalPages);
+  const pagedDrawings = useMemo(() => {
+    const start = (safePage - 1) * GALLERY_PAGE_SIZE;
+    return filteredDrawings.slice(start, start + GALLERY_PAGE_SIZE);
+  }, [filteredDrawings, safePage]);
+
+  const activeImageBytes = useMemo(() => {
+    if (!activeDrawing?.url || !activeDrawing.url.startsWith('data:')) return 0;
+    return estimateDataUrlBytes(activeDrawing.url);
+  }, [activeDrawing?.url]);
 
   return (
     <div className="space-y-6">
@@ -327,6 +454,10 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
             <span>DFM工程圖庫管理</span>
             <span aria-hidden="true">·</span>
             <span>共 {drawings.length} 張工程圖面</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              歷史步驟 {history.index + 1}/{history.stack.length}
+            </span>
             <span aria-hidden="true">·</span>
             <span
               className={
@@ -395,11 +526,12 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
 
           <button
             type="button"
+            disabled={isUploading}
             onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
+            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
           >
             <Upload className="w-3.5 h-3.5" />
-            <span>上傳圖片新增至圖庫</span>
+            <span>{isUploading ? '處理中...' : '上傳圖片新增至圖庫'}</span>
           </button>
 
           <button
@@ -442,7 +574,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
               全部 ({drawings.length})
             </button>
             {DFM_CATEGORIES.map((cat) => {
-              const count = drawings.filter((d) => d.category === cat).length;
+              const count = categoryCountMap[cat] || 0;
               if (count === 0 && selectedCategory !== cat) return null;
               return (
                 <button
@@ -461,9 +593,9 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
             })}
           </div>
 
-          {/* Drawing Cards List */}
-          <div className="space-y-3 max-h-[680px] overflow-y-auto pr-1">
-            {filteredDrawings.length === 0 ? (
+          {/* Drawing Cards List (Paginated & Lazy-Loaded Thumbnails) */}
+          <div className="space-y-3 max-h-[640px] overflow-y-auto pr-1">
+            {pagedDrawings.length === 0 ? (
               <div className="py-12 text-center text-xs text-slate-500 space-y-2">
                 <p>找不到符合條件的工程圖面</p>
                 <button
@@ -478,7 +610,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                 </button>
               </div>
             ) : (
-              filteredDrawings.map((item) => {
+              pagedDrawings.map((item) => {
                 const isSelected = activeDrawing?.id === item.id;
                 return (
                   <div
@@ -490,12 +622,14 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                         : 'bg-white border-slate-200 hover:border-slate-300'
                     }`}
                   >
-                    {/* Thumbnail */}
+                    {/* Lazy-loaded Thumbnail */}
                     <div className="w-28 aspect-16/10 bg-slate-950 rounded-lg overflow-hidden border border-slate-200 shrink-0 flex items-center justify-center relative">
                       {item.url ? (
                         <img
                           src={item.url}
                           alt={item.name}
+                          loading="lazy"
+                          decoding="async"
                           referrerPolicy="no-referrer"
                           className="w-full h-full object-contain"
                         />
@@ -560,6 +694,35 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
               })
             )}
           </div>
+
+          {/* Pagination Bar when > GALLERY_PAGE_SIZE */}
+          {totalPages > 1 && (
+            <div className="pt-2 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
+              <span className="font-mono tabular-nums">
+                第 {safePage} / {totalPages} 頁（共 {filteredDrawings.length} 張）
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={safePage <= 1}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  disabled={safePage >= totalPages}
+                  onClick={() =>
+                    setCurrentPage((p) => Math.min(totalPages, p + 1))
+                  }
+                  className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40"
+                >
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* RIGHT COLUMN (7 Cols): Selected Drawing Editor (Upload/Edit Image, Edit Description, Annotate, Save/Undo/Redo) */}
@@ -567,9 +730,16 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
           <div className="lg:col-span-7 bg-white border border-slate-200 rounded-2xl p-6 space-y-5 shadow-2xs">
             <div className="border-b border-slate-200 pb-3.5 flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h2 className="text-sm font-bold text-slate-900">
-                  編輯工程圖面與圖片說明
-                </h2>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-bold text-slate-900">
+                    編輯工程圖面與圖片說明
+                  </h2>
+                  {activeImageBytes > 0 && (
+                    <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                      · 圖檔大小約 {formatBytes(activeImageBytes)}
+                    </span>
+                  )}
+                </div>
                 <p className="text-xs text-slate-500 mt-0.5">
                   可上傳更換圖片、編寫詳細圖片說明、在畫面點擊標註不良紅點，並隨時復原、重做或儲存。
                 </p>
@@ -595,7 +765,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                   type="text"
                   value={activeDrawing.name}
                   onChange={(e) =>
-                    updateActiveDrawing({ name: e.target.value })
+                    updateActiveDrawing({ name: e.target.value }, 'name')
                   }
                   placeholder="例如：併板 V-Cut 板邊間距不足實測圖"
                   className="w-full px-3 py-2 text-xs sm:text-sm font-medium bg-white border border-slate-200 rounded-lg text-slate-900 focus:outline-none focus:border-blue-600"
@@ -659,29 +829,48 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
               </div>
 
               {inputMode === 'upload' ? (
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <span className="text-xs text-slate-600">
-                    支援 JPG / PNG / SVG / WebP 工程截圖，上傳後自動最佳化儲存並支援 Excel 內嵌匯出
-                  </span>
-                  <input
-                    ref={replaceFileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) processImageFile(file, 'replace');
-                      e.target.value = '';
-                    }}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => replaceFileInputRef.current?.click()}
-                    className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    選擇本機圖片覆蓋此圖面
-                  </button>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className="text-xs text-slate-600">
+                      支援 JPG / PNG / SVG / WebP 工程截圖，自動保留原始寬高比、透明背景與 Excel 內嵌匯出
+                    </span>
+                    <input
+                      ref={replaceFileInputRef}
+                      type="file"
+                      accept="image/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) processImageFile(file, 'replace');
+                        e.target.value = '';
+                      }}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      disabled={isUploading}
+                      onClick={() => replaceFileInputRef.current?.click()}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      {isUploading ? '圖片處理中...' : '選擇本機圖片覆蓋此圖面'}
+                    </button>
+                  </div>
+
+                  {compressionBanner && (
+                    <div className="px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between gap-2 text-xs text-emerald-900">
+                      <span className="font-mono flex items-center gap-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                        {compressionBanner}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setCompressionBanner(null)}
+                        className="text-[11px] text-emerald-700 hover:underline shrink-0"
+                      >
+                        隱藏
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="flex items-center gap-2">
@@ -692,12 +881,20 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                         ? ''
                         : activeDrawing.url
                     }
-                    onChange={(e) =>
-                      updateActiveDrawing({ url: e.target.value })
-                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      // Do not wipe existing Base64 image unless user actually pastes a non-empty URL
+                      if (
+                        activeDrawing.url.startsWith('data:') &&
+                        val.trim() === ''
+                      ) {
+                        return;
+                      }
+                      updateActiveDrawing({ url: val }, 'url');
+                    }}
                     placeholder={
                       activeDrawing.url.startsWith('data:')
-                        ? '目前使用上傳/內嵌影像 — 可在此貼上 https:// 圖片網址覆蓋...'
+                        ? '目前使用上傳/內嵌影像（受保護未刪除）— 若需改用外部圖片請貼上 https:// 網址...'
                         : '請貼上圖片網址 (https://...)'
                     }
                     className="w-full px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-blue-600"
@@ -797,8 +994,9 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                     ))}
                   </>
                 ) : (
-                  <div className="text-xs text-slate-400 py-16">
-                    尚未上傳圖片，請點擊上方「本機上傳圖片」
+                  <div className="text-xs text-slate-400 py-16 flex flex-col items-center gap-2">
+                    <AlertCircle className="w-6 h-6 text-slate-500" />
+                    <span>尚未上傳圖片，請點擊上方「本機上傳圖片」</span>
                   </div>
                 )}
               </div>
@@ -818,7 +1016,10 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
                 rows={3}
                 value={activeDrawing.description || ''}
                 onChange={(e) =>
-                  updateActiveDrawing({ description: e.target.value })
+                  updateActiveDrawing(
+                    { description: e.target.value },
+                    'description'
+                  )
                 }
                 placeholder="請編寫此圖片的詳細說明（例如：圖示 C102 距離底部 V-Cut 板邊僅 0.28mm，侵入紅色禁佈區）..."
                 className="w-full p-3 text-xs sm:text-sm leading-relaxed bg-white border border-slate-200 rounded-lg text-slate-800 focus:outline-none focus:border-blue-600"

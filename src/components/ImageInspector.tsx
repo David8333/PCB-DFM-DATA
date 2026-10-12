@@ -8,9 +8,15 @@ import {
   Layers,
   AlertCircle,
   ArrowUpRight,
+  CheckCircle2,
 } from 'lucide-react';
 import { ImageAnnotation, DfmDrawingItem } from '../types/dfm';
 import { PRESET_CAD_DIAGRAMS } from '../data/defaultTemplates';
+import {
+  processUploadedImageFile,
+  estimateDataUrlBytes,
+} from '../utils/imageProcessor';
+import { formatBytes } from '../utils/storageManager';
 
 interface ImageInspectorProps {
   imageUrl: string;
@@ -39,41 +45,50 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
   const [annotateMode, setAnnotateMode] = useState(false);
   const [newPinLabel, setNewPinLabel] = useState('間距不良點');
   const [imgError, setImgError] = useState(false);
+  const [isProcessingUpload, setIsProcessingUpload] = useState(false);
+  const [compressionSummary, setCompressionSummary] = useState<string | null>(
+    null
+  );
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageContainerRef = useRef<HTMLDivElement>(null);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        // Compress/resize image to max 960px width so localStorage stays fast and reliable
-        const canvas = document.createElement('canvas');
-        const maxW = 960;
-        const scale = img.width > maxW ? maxW / img.width : 1;
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.84);
-          setImgError(false);
-          onChangeImage(dataUrl);
-        }
-      };
-      if (typeof event.target?.result === 'string') {
-        img.src = event.target.result;
+    setIsProcessingUpload(true);
+    setUploadError(null);
+
+    try {
+      const result = await processUploadedImageFile(file, {
+        maxWidth: 960,
+        maxHeight: 960,
+        quality: 0.84,
+      });
+
+      if (!result.ok) {
+        setUploadError(result.error || '圖片處理失敗');
+      } else {
+        setImgError(false);
+        setCompressionSummary(result.summaryText);
+        onChangeImage(result.dataUrl);
       }
-    };
-    reader.readAsDataURL(file);
+    } catch {
+      setUploadError('圖片讀取或編碼過程發生未預期錯誤，請嘗試其他圖片。');
+    } finally {
+      setIsProcessingUpload(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
   };
 
   const handleImageClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!annotateMode || !imageContainerRef.current) return;
     const rect = imageContainerRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
     const x = Math.round(((e.clientX - rect.left) / rect.width) * 100);
     const y = Math.round(((e.clientY - rect.top) / rect.height) * 100);
 
@@ -91,10 +106,14 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
     onChangeAnnotations(annotations.filter((a) => a.id !== id));
   };
 
+  const currentImageEstimatedBytes = imageUrl.startsWith('data:')
+    ? estimateDataUrlBytes(imageUrl)
+    : 0;
+
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold text-slate-800">
             不良畫面 / CAD 圖面 (Image)
           </span>
@@ -104,6 +123,16 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
           <span className="text-xs text-slate-500">
             支援圖片網址、本機上傳與 DFM工程圖庫
           </span>
+          {currentImageEstimatedBytes > 0 && (
+            <>
+              <span className="text-xs text-slate-400" aria-hidden="true">
+                ·
+              </span>
+              <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                目前圖檔約 {formatBytes(currentImageEstimatedBytes)}
+              </span>
+            </>
+          )}
         </div>
 
         {/* Interactive Mode Switcher */}
@@ -154,12 +183,18 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
             type="url"
             value={imageUrl.startsWith('data:') ? '' : imageUrl}
             onChange={(e) => {
+              const val = e.target.value;
               setImgError(false);
-              onChangeImage(e.target.value);
+              setCompressionSummary(null);
+              // Do not overwrite existing Base64 image if the user just focused/cleared an already-empty URL box
+              if (imageUrl.startsWith('data:') && val.trim() === '') {
+                return;
+              }
+              onChangeImage(val);
             }}
             placeholder={
               imageUrl.startsWith('data:')
-                ? '目前已載入內嵌/上傳影像 — 可在此貼上外部圖片 URL 覆蓋...'
+                ? '目前已載入內嵌/上傳影像（受保護未刪除）— 若需改用外部圖片請直接貼上 https:// 網址...'
                 : '貼上圖片網址 (https://...) 或圖床連結'
             }
             className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-lg text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-blue-600"
@@ -167,7 +202,10 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
           {imageUrl && (
             <button
               type="button"
-              onClick={() => onChangeImage('')}
+              onClick={() => {
+                setCompressionSummary(null);
+                onChangeImage('');
+              }}
               className="px-3 py-2 text-xs font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0"
             >
               清除圖片
@@ -177,25 +215,51 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
       )}
 
       {inputMode === 'upload' && (
-        <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg">
-          <div className="text-xs text-slate-600">
-            選擇 PCB Gerber 截圖、AOI 不良照片或 3D 機構干涉圖（自動最佳化儲存於瀏覽器）
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-50 border border-dashed border-slate-300 rounded-lg">
+            <div className="text-xs text-slate-600">
+              選擇 PCB Gerber 截圖、AOI 不良照片或 SVG/PNG 圖面（自動保留原始寬高比與透明背景）
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+            <button
+              type="button"
+              disabled={isProcessingUpload}
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              {isProcessingUpload ? '圖片處理中...' : '選擇本機圖片上傳'}
+            </button>
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            onChange={handleFileUpload}
-            className="hidden"
-          />
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            選擇本機圖片上傳
-          </button>
+
+          {compressionSummary && (
+            <div className="px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between gap-2 text-xs text-emerald-900">
+              <span className="flex items-center gap-1.5 font-mono">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                {compressionSummary}
+              </span>
+              <button
+                type="button"
+                onClick={() => setCompressionSummary(null)}
+                className="text-[11px] text-emerald-700 hover:underline shrink-0"
+              >
+                隱藏
+              </button>
+            </div>
+          )}
+
+          {uploadError && (
+            <div className="px-3 py-2 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2 text-xs text-red-800">
+              <AlertCircle className="w-3.5 h-3.5 text-red-600 shrink-0" />
+              <span>{uploadError}</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -221,6 +285,7 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
                 type="button"
                 onClick={() => {
                   setImgError(false);
+                  setCompressionSummary(null);
                   if (onApplyDrawing) {
                     onApplyDrawing(preset);
                   } else {
