@@ -26,6 +26,7 @@ import {
   estimateDataUrlBytes,
 } from '../utils/imageProcessor';
 import { formatBytes } from '../utils/storageManager';
+import { saveDataUrlToVault } from '../utils/indexedDbManager';
 
 interface DfmDrawingGalleryProps {
   drawings: DfmDrawingItem[];
@@ -46,6 +47,7 @@ const GALLERY_PAGE_SIZE = 20;
 function shallowCloneDrawingItem(item: DfmDrawingItem): DfmDrawingItem {
   return {
     ...item,
+    imageId: item.imageId,
     annotations: item.annotations
       ? item.annotations.map((pin) => ({ ...pin }))
       : [],
@@ -275,14 +277,14 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [handleSaveGallery, handleUndo, handleRedo]);
 
-  // Compress uploaded image using unified imageProcessor
+  // Compress uploaded image using unified imageProcessor and persist to IndexedDB
   const processImageFile = async (file: File, mode: 'new' | 'replace') => {
     setIsUploading(true);
     try {
       const result = await processUploadedImageFile(file, {
-        maxWidth: 1080,
-        maxHeight: 1080,
-        quality: 0.85,
+        maxWidth: 1280,
+        maxHeight: 1280,
+        quality: 0.88,
       });
 
       if (!result.ok) {
@@ -290,9 +292,21 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
         return;
       }
 
-      setCompressionBanner(result.summaryText);
+      // Persist binary Blob directly into IndexedDB vault
+      const vaultRes = await saveDataUrlToVault(result.dataUrl, {
+        source: 'upload',
+        fileName: file.name,
+        width: result.width,
+        height: result.height,
+      });
+
+      const vaultNote = vaultRes.ok
+        ? ` · 已存入 IndexedDB（${vaultRes.isDuplicate ? '自動去重引用' : '二進位保存'}）`
+        : '';
+      setCompressionBanner(`${result.summaryText}${vaultNote}`);
       const cleanFileName = file.name.replace(/\.[^/.]+$/, '');
       const today = new Date().toISOString().slice(0, 10);
+      const targetUrl = vaultRes.ok ? vaultRes.blobUrl : result.dataUrl;
 
       if (mode === 'new') {
         const newItem: DfmDrawingItem = {
@@ -302,7 +316,8 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
             selectedCategory !== 'ALL'
               ? (selectedCategory as DfmCategory)
               : 'PCB Layout',
-          url: result.dataUrl,
+          url: targetUrl,
+          imageId: vaultRes.imageId,
           description: `圖示：${cleanFileName}（請在此編寫圖片說明與 DFM 判讀重點）`,
           annotations: [],
           updatedAt: today,
@@ -310,10 +325,10 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
         const nextList = [newItem, ...drawings];
         commitDrawingsChange(nextList);
         setSelectedDrawingId(newItem.id);
-        onShowToast(`已上傳並新增工程圖面「${newItem.name}」（${result.summaryText}）`);
+        onShowToast(`已上傳並新增工程圖面「${newItem.name}」`);
       } else if (activeDrawing) {
-        updateActiveDrawing({ url: result.dataUrl });
-        onShowToast(`已更新「${activeDrawing.name}」圖檔（${result.summaryText}）`);
+        updateActiveDrawing({ url: targetUrl, imageId: vaultRes.imageId });
+        onShowToast(`已更新「${activeDrawing.name}」圖檔`);
       }
     } catch {
       onShowToast('圖片處理過程發生錯誤，請確認圖片格式是否正確', 'error');
@@ -333,6 +348,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
           ? (selectedCategory as DfmCategory)
           : 'PCB Layout',
       url: drawings[0]?.url || '',
+      imageId: drawings[0]?.imageId,
       description: '請輸入此工程圖面的詳細圖片說明、不良位置描述或量測數值...',
       annotations: [],
       updatedAt: today,
@@ -351,6 +367,7 @@ export const DfmDrawingGallery: React.FC<DfmDrawingGalleryProps> = ({
       ...item,
       id: `drawing-${Date.now()}`,
       name: `${item.name} (副本)`,
+      imageId: item.imageId,
       annotations: item.annotations
         ? item.annotations.map((a) => ({ ...a }))
         : [],

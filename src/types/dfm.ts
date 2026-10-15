@@ -30,6 +30,7 @@ export interface DfmDrawingItem {
   name: string;
   category: DfmCategory;
   url: string;
+  imageId?: string; // Persistent ID in IndexedDB image vault
   description: string; // 圖片說明
   annotations?: ImageAnnotation[];
   updatedAt: string;
@@ -45,6 +46,7 @@ export interface DfmTemplate {
   recommendationTemplate: string;
   referenceSpec: string;
   imageUrl: string;
+  imageId?: string; // Persistent ID in IndexedDB image vault
   imageCaption?: string;
   annotations?: ImageAnnotation[];
   variableDefaults: Record<string, string>;
@@ -62,6 +64,7 @@ export interface CompiledReportItem {
   compiledRecommendation: string;
   referenceSpec: string;
   imageUrl: string;
+  imageId?: string; // Persistent ID in IndexedDB image vault
   imageCaption?: string;
   annotations?: ImageAnnotation[];
   variableValues: Record<string, string>;

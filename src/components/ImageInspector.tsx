@@ -17,13 +17,15 @@ import {
   estimateDataUrlBytes,
 } from '../utils/imageProcessor';
 import { formatBytes } from '../utils/storageManager';
+import { saveDataUrlToVault } from '../utils/indexedDbManager';
 
 interface ImageInspectorProps {
   imageUrl: string;
+  imageId?: string;
   imageCaption: string;
   annotations: ImageAnnotation[];
   drawings?: DfmDrawingItem[];
-  onChangeImage: (url: string) => void;
+  onChangeImage: (url: string, imageId?: string) => void;
   onChangeCaption: (caption: string) => void;
   onChangeAnnotations: (annotations: ImageAnnotation[]) => void;
   onApplyDrawing?: (drawing: DfmDrawingItem) => void;
@@ -32,6 +34,7 @@ interface ImageInspectorProps {
 
 export const ImageInspector: React.FC<ImageInspectorProps> = ({
   imageUrl,
+  imageId,
   imageCaption,
   annotations,
   drawings = PRESET_CAD_DIAGRAMS,
@@ -63,17 +66,29 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
 
     try {
       const result = await processUploadedImageFile(file, {
-        maxWidth: 960,
-        maxHeight: 960,
-        quality: 0.84,
+        maxWidth: 1200,
+        maxHeight: 1200,
+        quality: 0.88,
       });
 
       if (!result.ok) {
         setUploadError(result.error || '圖片處理失敗');
       } else {
         setImgError(false);
-        setCompressionSummary(result.summaryText);
-        onChangeImage(result.dataUrl);
+        // Persist binary Blob directly into IndexedDB vault
+        const vaultRes = await saveDataUrlToVault(result.dataUrl, {
+          source: 'upload',
+          fileName: file.name,
+          width: result.width,
+          height: result.height,
+        });
+
+        const vaultNote = vaultRes.ok
+          ? ` · ${vaultRes.isDuplicate ? '已匹配圖庫相同指紋（去重引用）' : '已存入 IndexedDB 高速二進位儲存庫'}`
+          : '';
+
+        setCompressionSummary(`${result.summaryText}${vaultNote}`);
+        onChangeImage(vaultRes.ok ? vaultRes.blobUrl : result.dataUrl, vaultRes.imageId);
       }
     } catch {
       setUploadError('圖片讀取或編碼過程發生未預期錯誤，請嘗試其他圖片。');
@@ -123,6 +138,12 @@ export const ImageInspector: React.FC<ImageInspectorProps> = ({
           <span className="text-xs text-slate-500">
             支援圖片網址、本機上傳與 DFM工程圖庫
           </span>
+          {imageId && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+              IndexedDB 二進位保存
+            </span>
+          )}
           {currentImageEstimatedBytes > 0 && (
             <>
               <span className="text-xs text-slate-400" aria-hidden="true">

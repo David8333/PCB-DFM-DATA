@@ -188,6 +188,26 @@ export function safeWriteStorage<T>(
 }
 
 /**
+ * Creates a lean version of items for localStorage serialization.
+ * Strips heavy data: URLs from items that have an imageId stored in IndexedDB.
+ */
+export function stripImagesForLocalStorage<
+  T extends { imageUrl?: string; url?: string; imageId?: string }
+>(items: T[]): T[] {
+  return items.map((item) => {
+    if (item.imageId) {
+      if ('imageUrl' in item) {
+        return { ...item, imageUrl: '' };
+      }
+      if ('url' in item) {
+        return { ...item, url: '' };
+      }
+    }
+    return item;
+  });
+}
+
+/**
  * Initial loaders with legacy migration & field normalization
  */
 export function loadInitialTemplates(): {
@@ -207,6 +227,8 @@ export function loadInitialTemplates(): {
       ? tpl.category
       : 'PCB Layout',
     referenceModel: tpl.referenceModel ?? '',
+    imageId: tpl.imageId,
+    imageUrl: tpl.imageUrl ?? '',
     imageCaption: tpl.imageCaption ?? '',
     annotations: Array.isArray(tpl.annotations) ? tpl.annotations : [],
     variableDefaults:
@@ -241,7 +263,12 @@ export function loadInitialBatch(): {
     [],
     STORAGE_KEYS.BATCH_LEGACY_V1
   );
-  return { batch: res.data, warning: res.warning };
+  const normalized = res.data.map((b) => ({
+    ...b,
+    imageId: b.imageId,
+    imageUrl: b.imageUrl ?? '',
+  }));
+  return { batch: normalized, warning: res.warning };
 }
 
 export function loadInitialDrawings(): {
@@ -256,6 +283,8 @@ export function loadInitialDrawings(): {
   const normalized = res.data.map((d) => ({
     ...d,
     category: DFM_CATEGORIES.includes(d.category) ? d.category : 'PCB Layout',
+    imageId: d.imageId,
+    url: d.url ?? '',
     description: d.description ?? '',
     annotations: Array.isArray(d.annotations) ? d.annotations : [],
     updatedAt: d.updatedAt || new Date().toISOString().slice(0, 10),
@@ -295,9 +324,12 @@ export function estimateStorageMetrics(
 
   for (let i = 0; i < templates.length; i++) {
     const t = templates[i];
-    if (t.imageUrl && t.imageUrl.trim() !== '') {
+    if ((t.imageUrl && t.imageUrl.trim() !== '') || t.imageId) {
       templateWithImgCount++;
     }
+    // If stored in IndexedDB (imageId is present), imageUrl is stripped in localStorage
+    const storedImgLength = t.imageId ? (t.imageId.length + 15) : (t.imageUrl?.length || 0);
+
     charCount +=
       180 +
       (t.id?.length || 0) +
@@ -308,22 +340,24 @@ export function estimateStorageMetrics(
       (t.issueTemplate?.length || 0) +
       (t.recommendationTemplate?.length || 0) +
       (t.referenceSpec?.length || 0) +
-      (t.imageUrl?.length || 0) +
+      storedImgLength +
       (t.imageCaption?.length || 0) +
       (t.annotations?.length || 0) * 60;
   }
 
   for (let i = 0; i < drawings.length; i++) {
     const d = drawings[i];
-    if (d.url && d.url.trim() !== '') {
+    if ((d.url && d.url.trim() !== '') || d.imageId) {
       drawingWithImgCount++;
     }
+    const storedImgLength = d.imageId ? (d.imageId.length + 15) : (d.url?.length || 0);
+
     charCount +=
       120 +
       (d.id?.length || 0) +
       (d.name?.length || 0) +
       (d.category?.length || 0) +
-      (d.url?.length || 0) +
+      storedImgLength +
       (d.description?.length || 0) +
       (d.annotations?.length || 0) * 60;
   }
@@ -339,11 +373,12 @@ export function estimateStorageMetrics(
 
   for (let i = 0; i < reportBatch.length; i++) {
     const b = reportBatch[i];
+    const storedImgLength = b.imageId ? (b.imageId.length + 15) : (b.imageUrl?.length || 0);
     charCount +=
       180 +
       (b.compiledIssue?.length || 0) +
       (b.compiledRecommendation?.length || 0) +
-      (b.imageUrl?.length || 0) +
+      storedImgLength +
       (b.referenceSpec?.length || 0);
   }
 

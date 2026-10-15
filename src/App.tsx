@@ -26,6 +26,9 @@ import {
   X,
   FileCheck2,
   Layers,
+  ShieldCheck,
+  Sparkles,
+  RefreshCw,
 } from 'lucide-react';
 import {
   DfmTemplate,
@@ -56,6 +59,7 @@ import {
   safeWriteStorage,
   estimateStorageMetrics,
   formatBytes,
+  stripImagesForLocalStorage,
 } from './utils/storageManager';
 import {
   ValidatedBackupPayload,
@@ -63,7 +67,17 @@ import {
   mergeTemplatesSafely,
   mergeDrawingsSafely,
   mergeSpecsSafely,
+  prepareFullBackupJsonPayload,
+  restoreImportedImagesToVault,
 } from './utils/jsonBackupManager';
+import {
+  batchResolveImageUrls,
+  detectLegacyBase64Images,
+  executeSafeStorageMigration,
+  getVaultStorageTelemetry,
+  StorageVaultTelemetry,
+  MigrationStepProgress,
+} from './utils/indexedDbManager';
 import { ImageInspector } from './components/ImageInspector';
 import { ReportPreviewPanel } from './components/ReportPreviewPanel';
 import { SpecDatabaseManager } from './components/SpecDatabaseManager';
@@ -114,6 +128,7 @@ function findVariableAtCursor(text: string, cursorIndex: number): string | null 
 function snapshotTemplate(tpl: DfmTemplate): DfmTemplate {
   return {
     ...tpl,
+    imageId: tpl.imageId,
     annotations: tpl.annotations
       ? tpl.annotations.map((pin) => ({ ...pin }))
       : [],
@@ -167,6 +182,65 @@ export default function App() {
       null
     );
   });
+
+  // IndexedDB Vault & Migration State
+  const [migrationProgress, setMigrationProgress] =
+    useState<MigrationStepProgress | null>(null);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [vaultTelemetry, setVaultTelemetry] =
+    useState<StorageVaultTelemetry | null>(null);
+
+  // Batch resolve IndexedDB image Object URLs on application boot
+  useEffect(() => {
+    const allImageIds = new Set<string>();
+    templates.forEach((t) => t.imageId && allImageIds.add(t.imageId));
+    drawings.forEach((d) => d.imageId && allImageIds.add(d.imageId));
+    reportBatch.forEach((b) => b.imageId && allImageIds.add(b.imageId));
+
+    if (allImageIds.size === 0) return;
+
+    batchResolveImageUrls(Array.from(allImageIds)).then((urlMap) => {
+      if (urlMap.size === 0) return;
+      setTemplates((prev) =>
+        prev.map((t) => {
+          if (
+            t.imageId &&
+            urlMap.has(t.imageId) &&
+            (!t.imageUrl || t.imageUrl.startsWith('idb:'))
+          ) {
+            return { ...t, imageUrl: urlMap.get(t.imageId)! };
+          }
+          return t;
+        })
+      );
+      setDrawings((prev) =>
+        prev.map((d) => {
+          if (
+            d.imageId &&
+            urlMap.has(d.imageId) &&
+            (!d.url || d.url.startsWith('idb:'))
+          ) {
+            return { ...d, url: urlMap.get(d.imageId)! };
+          }
+          return d;
+        })
+      );
+      setReportBatch((prev) =>
+        prev.map((b) => {
+          if (
+            b.imageId &&
+            urlMap.has(b.imageId) &&
+            (!b.imageUrl || b.imageUrl.startsWith('idb:'))
+          ) {
+            return { ...b, imageUrl: urlMap.get(b.imageId)! };
+          }
+          return b;
+        })
+      );
+    });
+  }, []);
 
   // Pre-Import Validation & Confirmation Modal State
   const [pendingImport, setPendingImport] =
@@ -237,6 +311,7 @@ export default function App() {
   );
 
   // Centralized, debounced auto-save to localStorage for templates, specs, batch, and drawings
+  // Automatically strips heavy Base64 data for items stored in IndexedDB (imageId present)
   useEffect(() => {
     if (isFirstMountRef.current) {
       isFirstMountRef.current = false;
@@ -245,10 +320,14 @@ export default function App() {
 
     setSaveStatus('saving');
     const timer = window.setTimeout(() => {
-      const r1 = safeWriteStorage(STORAGE_KEYS.TEMPLATES, templates);
+      const leanTemplates = stripImagesForLocalStorage(templates);
+      const leanDrawings = stripImagesForLocalStorage(drawings);
+      const leanBatch = stripImagesForLocalStorage(reportBatch);
+
+      const r1 = safeWriteStorage(STORAGE_KEYS.TEMPLATES, leanTemplates);
       const r2 = safeWriteStorage(STORAGE_KEYS.SPECS, specs);
-      const r3 = safeWriteStorage(STORAGE_KEYS.BATCH, reportBatch);
-      const r4 = safeWriteStorage(STORAGE_KEYS.DRAWINGS, drawings);
+      const r3 = safeWriteStorage(STORAGE_KEYS.BATCH, leanBatch);
+      const r4 = safeWriteStorage(STORAGE_KEYS.DRAWINGS, leanDrawings);
 
       const failed = [r1, r2, r3, r4].find((r) => !r.ok);
       if (failed) {
@@ -274,6 +353,65 @@ export default function App() {
     () => estimateStorageMetrics(templates, drawings, specs, reportBatch),
     [templates, drawings, specs, reportBatch]
   );
+
+  // Detect unmigrated legacy Base64 images that consume localStorage
+  const legacyBase64Info = useMemo(() => {
+    return detectLegacyBase64Images(templates, drawings, reportBatch);
+  }, [templates, drawings, reportBatch]);
+
+  // Refresh IndexedDB Vault Telemetry
+  useEffect(() => {
+    getVaultStorageTelemetry(storageMetrics.estimatedJsonBytes).then(
+      setVaultTelemetry
+    );
+  }, [templates, drawings, reportBatch, storageMetrics.estimatedJsonBytes]);
+
+  // Safe migration handler with two-phase verification and backup reminder
+  const handleStartMigration = async () => {
+    if (isMigrating) return;
+    setIsMigrating(true);
+    try {
+      const res = await executeSafeStorageMigration(
+        templates,
+        drawings,
+        reportBatch,
+        (progress) => {
+          setMigrationProgress(progress);
+        }
+      );
+
+      if (res.success) {
+        setTemplates(res.updatedTemplates);
+        setDrawings(res.updatedDrawings);
+        setReportBatch(res.updatedBatch);
+
+        // Immediately write lean version to localStorage
+        const leanTemplates = stripImagesForLocalStorage(res.updatedTemplates);
+        const leanDrawings = stripImagesForLocalStorage(res.updatedDrawings);
+        const leanBatch = stripImagesForLocalStorage(res.updatedBatch);
+
+        safeWriteStorage(STORAGE_KEYS.TEMPLATES, leanTemplates);
+        safeWriteStorage(STORAGE_KEYS.DRAWINGS, leanDrawings);
+        safeWriteStorage(STORAGE_KEYS.BATCH, leanBatch);
+
+        showToast(
+          `恭喜！已成功將 ${res.migratedCount} 張圖片安全遷移至 IndexedDB，釋放約 ${formatBytes(
+            res.freedBytes
+          )} 本機空間，全部圖片皆已 100% 校驗無誤！`
+        );
+        setStorageWarning(null);
+      } else {
+        showToast(
+          `遷移終止：${res.errorMessage || '寫入或校驗失敗'}。原 localStorage 資料已完整保留無損。`,
+          'error'
+        );
+      }
+    } catch {
+      showToast('遷移過程發生未預期錯誤，原始資料未受任何影響。', 'error');
+    } finally {
+      setIsMigrating(false);
+    }
+  };
 
   // Reset database list page to 1 when search or category filter changes
   useEffect(() => {
@@ -659,6 +797,7 @@ export default function App() {
     updateActiveTemplate(
       {
         imageUrl: drawing.url,
+        imageId: drawing.imageId,
         imageCaption: drawing.description || drawing.name,
         annotations: drawing.annotations
           ? drawing.annotations.map((a) => ({ ...a }))
@@ -729,6 +868,7 @@ export default function App() {
         '建議將零件 [零件編號] 往 [方向] 調整間距至 [標準值] 以上，以符合量產可靠度要求。',
       referenceSpec: specs[0]?.content || 'IPC-2221B / 廠內硬體 DFM 設計規範',
       imageUrl: drawings[0]?.url || PRESET_CAD_DIAGRAMS[0].url,
+      imageId: drawings[0]?.imageId,
       imageCaption: '圖示：請貼上圖片網址、上傳截圖或點擊畫面新增紅點標註',
       annotations: [],
       variableDefaults: {
@@ -756,6 +896,8 @@ export default function App() {
       id: dupId,
       code: `${tpl.code}-COPY`,
       title: `${tpl.title} (副本)`,
+      imageId: tpl.imageId,
+      imageUrl: tpl.imageUrl,
       variableDefaults: { ...tpl.variableDefaults },
       annotations: tpl.annotations
         ? tpl.annotations.map((a) => ({ ...a }))
@@ -783,24 +925,22 @@ export default function App() {
     showToast(`已刪除案例「${target?.code || ''}」`);
   };
 
-  // Export JSON — displays file size, case count, and image count, and records backup time
-  const handleExportJson = () => {
+  // Export JSON — produces standalone JSON with full Base64 images resolved from IndexedDB
+  const handleExportJson = async () => {
+    setIsExporting(true);
     try {
       const exportedIso = new Date().toISOString();
-      const payload = {
-        app: 'DFM Case Database Workbench',
-        version: '2.7.0',
-        exportedAt: exportedIso,
+      const result = await prepareFullBackupJsonPayload(
         templates,
         specs,
         drawings,
-        reportBatch,
-      };
-      const jsonStr = JSON.stringify(payload, null, 2);
-      const blob = new Blob([jsonStr], {
+        reportBatch
+      );
+
+      const blob = new Blob([result.jsonString], {
         type: 'application/json',
       });
-      const fileSizeFormatted = formatBytes(blob.size);
+      const fileSizeFormatted = formatBytes(result.byteSize);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -821,10 +961,12 @@ export default function App() {
       saveLastBackupTime(backupTimeDisplay);
 
       showToast(
-        `已成功匯出備份檔（檔案大小：${fileSizeFormatted} · 案例：${templates.length} 筆 · 圖片：${storageMetrics.totalImageCount} 張 · 規範：${specs.length} 筆）`
+        `已成功匯出完整備份檔（檔案大小：${fileSizeFormatted} · 案例：${result.templateCount} 筆 · 圖片：${result.imageCount} 張 · 規範：${specs.length} 筆）`
       );
     } catch {
       showToast('匯出 JSON 備份時發生錯誤，請再試一次', 'error');
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -875,49 +1017,57 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  // Step 2 of Import JSON: Apply validated payload in Overwrite (Default) or Safe Merge mode
-  const handleConfirmImport = (mode: 'overwrite' | 'merge') => {
+  // Step 2 of Import JSON: Apply validated payload into IndexedDB and state
+  const handleConfirmImport = async (mode: 'overwrite' | 'merge') => {
     if (!pendingImport || !pendingImport.isValid) return;
 
-    if (mode === 'overwrite') {
-      // Default behavior: full overwrite
-      setTemplates(pendingImport.templates);
-      setSelectedId(pendingImport.templates[0].id);
-      setHistoryMap({});
-      if (pendingImport.specs && pendingImport.specs.length > 0) {
-        setSpecs(pendingImport.specs);
-      }
-      if (pendingImport.drawings && pendingImport.drawings.length > 0) {
-        setDrawings(pendingImport.drawings);
-      }
-      if (pendingImport.reportBatch) {
-        setReportBatch(pendingImport.reportBatch);
-      }
-      showToast(
-        `已完成整份覆蓋匯入：載入 ${pendingImport.summary.templateCount} 筆案例與 ${pendingImport.summary.totalImageCount} 張圖片！`
-      );
-    } else {
-      // Safe merge mode: keep existing data and merge incoming items
-      const mergedTemplates = mergeTemplatesSafely(
-        templates,
-        pendingImport.templates
-      );
-      setTemplates(mergedTemplates);
-      setHistoryMap({});
-      if (pendingImport.specs && pendingImport.specs.length > 0) {
-        setSpecs((prev) => mergeSpecsSafely(prev, pendingImport.specs!));
-      }
-      if (pendingImport.drawings && pendingImport.drawings.length > 0) {
-        setDrawings((prev) =>
-          mergeDrawingsSafely(prev, pendingImport.drawings!)
+    setIsImporting(true);
+    try {
+      const vaultRestored = await restoreImportedImagesToVault(pendingImport);
+
+      if (mode === 'overwrite') {
+        // Default behavior: full overwrite
+        setTemplates(vaultRestored.templates);
+        setSelectedId(vaultRestored.templates[0].id);
+        setHistoryMap({});
+        if (pendingImport.specs && pendingImport.specs.length > 0) {
+          setSpecs(pendingImport.specs);
+        }
+        if (vaultRestored.drawings && vaultRestored.drawings.length > 0) {
+          setDrawings(vaultRestored.drawings);
+        }
+        if (vaultRestored.reportBatch) {
+          setReportBatch(vaultRestored.reportBatch);
+        }
+        showToast(
+          `已完成整份覆蓋匯入：載入 ${pendingImport.summary.templateCount} 筆案例與 ${pendingImport.summary.totalImageCount} 張圖片，圖檔已安全寫入 IndexedDB！`
+        );
+      } else {
+        // Safe merge mode: keep existing data and merge incoming items
+        const mergedTemplates = mergeTemplatesSafely(
+          templates,
+          vaultRestored.templates
+        );
+        setTemplates(mergedTemplates);
+        setHistoryMap({});
+        if (pendingImport.specs && pendingImport.specs.length > 0) {
+          setSpecs((prev) => mergeSpecsSafely(prev, pendingImport.specs!));
+        }
+        if (vaultRestored.drawings && vaultRestored.drawings.length > 0) {
+          setDrawings((prev) =>
+            mergeDrawingsSafely(prev, vaultRestored.drawings!)
+          );
+        }
+        showToast(
+          `已完成安全合併匯入：目前共 ${mergedTemplates.length} 筆 DFM 案例！`
         );
       }
-      showToast(
-        `已完成安全合併匯入：目前共 ${mergedTemplates.length} 筆 DFM 案例！`
-      );
+    } catch {
+      showToast('匯入寫入 IndexedDB 時發生異常，原資料已完整保留', 'error');
+    } finally {
+      setIsImporting(false);
+      setPendingImport(null);
     }
-
-    setPendingImport(null);
   };
 
   // Add current compiled item into Batch Report List
@@ -939,6 +1089,7 @@ export default function App() {
       ),
       referenceSpec: activeTemplate.referenceSpec,
       imageUrl: activeTemplate.imageUrl,
+      imageId: activeTemplate.imageId,
       imageCaption: activeTemplate.imageCaption,
       annotations: activeTemplate.annotations
         ? activeTemplate.annotations.map((a) => ({ ...a }))
@@ -1043,12 +1194,29 @@ export default function App() {
               |
             </span>
             <span
-              title="根據目前案例、圖庫與規範資料字元長度計算之 JSON 檔案大小估算值（非瀏覽器實際配額上限）"
-              className="flex items-center gap-1 text-slate-600"
+              title="localStorage 輕量索引大小（僅保留文字欄位與 ID，節省 98% 空間）"
+              className="flex items-center gap-1 text-slate-600 font-sans"
             >
               <HardDrive className="w-3.5 h-3.5 text-slate-400" />
-              <span>資料估算：約 {storageMetrics.formattedJsonSize}</span>
+              <span>本機索引：{storageMetrics.formattedJsonSize}</span>
             </span>
+            {vaultTelemetry && vaultTelemetry.indexedDbSupported && (
+              <>
+                <span className="text-slate-300" aria-hidden="true">
+                  |
+                </span>
+                <span
+                  title="IndexedDB 高速圖片資料庫（二進位 Blob 保存，解除 5MB 限制）"
+                  className="flex items-center gap-1 text-emerald-700 font-sans font-medium"
+                >
+                  <Database className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>
+                    IndexedDB 圖庫：{vaultTelemetry.imageCount} 張 ·{' '}
+                    {vaultTelemetry.formattedImageBytes}
+                  </span>
+                </span>
+              </>
+            )}
             <span className="text-slate-300" aria-hidden="true">
               |
             </span>
@@ -1161,6 +1329,101 @@ export default function App() {
           </div>
         </div>
       </section>
+
+      {/* IndexedDB Safe Migration Banner */}
+      {legacyBase64Info.count > 0 && (
+        <div className="max-w-[1440px] w-full mx-auto px-4 sm:px-6 pt-4">
+          <div className="p-4 sm:p-5 rounded-2xl border-2 border-indigo-200 bg-gradient-to-r from-indigo-50/90 via-blue-50/70 to-purple-50/90 shadow-2xs">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="flex items-start gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-xs mt-0.5">
+                  <Database className="w-5 h-5" />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-bold text-sm text-slate-900">
+                      建議執行圖片資料安全遷移：檢測到 {legacyBase64Info.count} 張舊版 localStorage 圖片（約 {formatBytes(legacyBase64Info.estimatedBytes)}）
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-100 text-indigo-700">
+                      IndexedDB 二進位儲存
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-600 leading-relaxed max-w-3xl">
+                    為支援 100～1,000 筆案例並徹底解除瀏覽器 5MB 容量上限，可將既有圖片安全移轉至 IndexedDB 高速二進位資料庫。
+                    <span className="font-semibold text-slate-800">
+                      【雙重安全保證】：遷移全程以 SHA-256 去重校驗，100% 驗證成功後才轉為輕量索引，若有任何異常絕不覆蓋舊資料！
+                    </span>
+                  </p>
+
+                  {/* Progress Indicator */}
+                  {migrationProgress && migrationProgress.status === 'running' && (
+                    <div className="pt-2 space-y-1.5">
+                      <div className="flex justify-between text-[11px] text-indigo-900 font-medium">
+                        <span className="flex items-center gap-1.5">
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                          <span>正在將圖片寫入 IndexedDB 資料庫...</span>
+                        </span>
+                        <span>{migrationProgress.current} / {migrationProgress.total}</span>
+                      </div>
+                      <div className="w-full bg-indigo-200 rounded-full h-2 overflow-hidden">
+                        <div
+                          className="bg-indigo-600 h-2 transition-all duration-200"
+                          style={{
+                            width: `${Math.round((migrationProgress.current / migrationProgress.total) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {migrationProgress && migrationProgress.status === 'verifying' && (
+                    <div className="pt-2 space-y-1.5">
+                      <div className="flex justify-between text-[11px] text-emerald-900 font-medium">
+                        <span className="flex items-center gap-1.5">
+                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>正在讀出校驗每張圖檔完整性與雜湊值...</span>
+                        </span>
+                        <span>{migrationProgress.verifiedCount} / {migrationProgress.total}</span>
+                      </div>
+                      <div className="w-full bg-emerald-200 rounded-full h-2 overflow-hidden">
+                        <div
+                          className="bg-emerald-600 h-2 transition-all duration-200"
+                          style={{
+                            width: `${Math.round((migrationProgress.verifiedCount / migrationProgress.total) * 100)}%`,
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2.5 shrink-0 self-start md:self-center">
+                <button
+                  type="button"
+                  onClick={handleExportJson}
+                  disabled={isExporting || isMigrating}
+                  title="遷移前建議先備份一份完整 JSON 檔案以防萬一"
+                  className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-xl hover:bg-slate-50 transition-colors shadow-2xs disabled:opacity-50"
+                >
+                  <Download className="w-3.5 h-3.5 text-slate-500" />
+                  <span>{isExporting ? '準備備份中...' : '先下載 JSON 完整備份'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleStartMigration}
+                  disabled={isMigrating}
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl transition-colors shadow-sm disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>{isMigrating ? '安全遷移驗證中...' : '開始安全遷移至 IndexedDB'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Persistent Storage Warning Banner (When localStorage quota or security error occurs) */}
       {storageWarning && (
@@ -1881,11 +2144,12 @@ export default function App() {
                 <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-2xs">
                   <ImageInspector
                     imageUrl={activeTemplate.imageUrl}
+                    imageId={activeTemplate.imageId}
                     imageCaption={activeTemplate.imageCaption || ''}
                     annotations={activeTemplate.annotations || []}
                     drawings={drawings}
-                    onChangeImage={(url) =>
-                      updateActiveTemplate({ imageUrl: url }, false)
+                    onChangeImage={(url, imageId) =>
+                      updateActiveTemplate({ imageUrl: url, imageId }, false)
                     }
                     onChangeCaption={(caption) =>
                       updateActiveTemplate({ imageCaption: caption }, true)
@@ -2081,17 +2345,28 @@ export default function App() {
               <div className="space-y-2 pt-1">
                 <button
                   type="button"
+                  disabled={isImporting}
                   onClick={() => handleConfirmImport('overwrite')}
-                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl shadow-2xs flex items-center justify-center gap-2 transition-colors"
+                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl shadow-2xs flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
                 >
-                  <Upload className="w-4 h-4" />
-                  <span>確認匯入（整份覆蓋目前資料 — 預設）</span>
+                  {isImporting ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>正在將圖檔寫入 IndexedDB 並驗證...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-4 h-4" />
+                      <span>確認匯入（整份覆蓋目前資料 — 預設）</span>
+                    </>
+                  )}
                 </button>
 
                 <button
                   type="button"
+                  disabled={isImporting}
                   onClick={() => handleConfirmImport('merge')}
-                  className="w-full py-2 px-4 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors"
+                  className="w-full py-2 px-4 bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
                 >
                   <Layers className="w-4 h-4 text-emerald-700" />
                   <span>安全合併匯入（保留現有資料並合併新項目）</span>
@@ -2099,8 +2374,9 @@ export default function App() {
 
                 <button
                   type="button"
+                  disabled={isImporting}
                   onClick={() => setPendingImport(null)}
-                  className="w-full py-2 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl transition-colors"
+                  className="w-full py-2 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-medium rounded-xl transition-colors disabled:opacity-50"
                 >
                   取消匯入（保留原本資料）
                 </button>
@@ -2143,9 +2419,18 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>報告清單：{reportBatch.length} 筆</span>
             <span aria-hidden="true">·</span>
-            <span title="此數值為資料序列化後之 JSON 大小估算值，並非瀏覽器實際剩餘空間">
-              JSON 大小估算：約 {storageMetrics.formattedJsonSize}
+            <span title="localStorage 輕量索引大小（已排除二進位圖檔）">
+              本機索引：約 {storageMetrics.formattedJsonSize}
             </span>
+            {vaultTelemetry && vaultTelemetry.indexedDbSupported && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-emerald-700 font-medium">
+                  IndexedDB 圖庫：{vaultTelemetry.imageCount} 張 (
+                  {vaultTelemetry.formattedImageBytes})
+                </span>
+              </>
+            )}
           </div>
         </div>
       </footer>

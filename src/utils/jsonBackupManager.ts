@@ -8,6 +8,7 @@ import {
 } from '../types/dfm';
 import { DFM_CATEGORIES } from '../data/defaultTemplates';
 import { formatBytes } from './storageManager';
+import { resolveItemToDataUrl, saveDataUrlToVault, isIndexedDbSupported } from './indexedDbManager';
 
 export interface BackupSummaryInfo {
   fileName: string;
@@ -225,6 +226,7 @@ export function parseAndValidateBackupJson(
       referenceSpec:
         typeof rec.referenceSpec === 'string' ? rec.referenceSpec : '',
       imageUrl,
+      imageId: typeof rec.imageId === 'string' && rec.imageId.trim() ? rec.imageId.trim() : undefined,
       imageCaption:
         typeof rec.imageCaption === 'string' ? rec.imageCaption : '',
       annotations: sanitizeAnnotations(rec.annotations),
@@ -312,6 +314,7 @@ export function parseAndValidateBackupJson(
             : `匯入工程圖面 #${i + 1}`,
         category,
         url,
+        imageId: typeof rec.imageId === 'string' && rec.imageId.trim() ? rec.imageId.trim() : undefined,
         description:
           typeof rec.description === 'string' ? rec.description : '',
         annotations: sanitizeAnnotations(rec.annotations),
@@ -356,6 +359,7 @@ export function parseAndValidateBackupJson(
         referenceSpec:
           typeof rec.referenceSpec === 'string' ? rec.referenceSpec : '',
         imageUrl: typeof rec.imageUrl === 'string' ? rec.imageUrl : '',
+        imageId: typeof rec.imageId === 'string' && rec.imageId.trim() ? rec.imageId.trim() : undefined,
         imageCaption:
           typeof rec.imageCaption === 'string' ? rec.imageCaption : '',
         annotations: sanitizeAnnotations(rec.annotations),
@@ -465,4 +469,209 @@ export function mergeSpecsSafely(
     }
   }
   return result;
+}
+
+/**
+ * Prepares a complete, self-contained JSON backup payload containing full Data URL images.
+ * This guarantees the exported JSON can be transferred to another computer or backup disk
+ * without missing any images that were stored in IndexedDB.
+ */
+export async function prepareFullBackupJsonPayload(
+  templates: DfmTemplate[],
+  specs: ReferenceSpecItem[],
+  drawings: DfmDrawingItem[],
+  reportBatch: CompiledReportItem[],
+  onProgress?: (current: number, total: number) => void
+): Promise<{
+  jsonString: string;
+  byteSize: number;
+  templateCount: number;
+  drawingCount: number;
+  imageCount: number;
+}> {
+  const totalItems = templates.length + drawings.length + reportBatch.length;
+  let processed = 0;
+  let resolvedImageCount = 0;
+
+  // Resolve template images
+  const fullTemplates: DfmTemplate[] = [];
+  for (const t of templates) {
+    let fullUrl = t.imageUrl;
+    if (t.imageId || (t.imageUrl && t.imageUrl.startsWith('blob:'))) {
+      const dataUrl = await resolveItemToDataUrl(t.imageUrl, t.imageId);
+      if (dataUrl) fullUrl = dataUrl;
+    }
+    if (fullUrl && fullUrl.trim() !== '') {
+      resolvedImageCount++;
+    }
+    fullTemplates.push({
+      ...t,
+      imageUrl: fullUrl,
+    });
+    processed++;
+    onProgress?.(processed, totalItems);
+  }
+
+  // Resolve drawing images
+  const fullDrawings: DfmDrawingItem[] = [];
+  for (const d of drawings) {
+    let fullUrl = d.url;
+    if (d.imageId || (d.url && d.url.startsWith('blob:'))) {
+      const dataUrl = await resolveItemToDataUrl(d.url, d.imageId);
+      if (dataUrl) fullUrl = dataUrl;
+    }
+    if (fullUrl && fullUrl.trim() !== '') {
+      resolvedImageCount++;
+    }
+    fullDrawings.push({
+      ...d,
+      url: fullUrl,
+    });
+    processed++;
+    onProgress?.(processed, totalItems);
+  }
+
+  // Resolve report batch images
+  const fullBatch: CompiledReportItem[] = [];
+  for (const b of reportBatch) {
+    let fullUrl = b.imageUrl;
+    if (b.imageId || (b.imageUrl && b.imageUrl.startsWith('blob:'))) {
+      const dataUrl = await resolveItemToDataUrl(b.imageUrl, b.imageId);
+      if (dataUrl) fullUrl = dataUrl;
+    }
+    fullBatch.push({
+      ...b,
+      imageUrl: fullUrl,
+    });
+    processed++;
+    onProgress?.(processed, totalItems);
+  }
+
+  const exportPayload = {
+    version: '2.1 (IndexedDB Vault Compatible)',
+    exportedAt: new Date().toISOString(),
+    generator: 'PCB DFM Engineering Workbench',
+    templates: fullTemplates,
+    specs,
+    drawings: fullDrawings,
+    reportBatch: fullBatch,
+  };
+
+  const jsonString = JSON.stringify(exportPayload, null, 2);
+  const byteSize = new TextEncoder().encode(jsonString).length;
+
+  return {
+    jsonString,
+    byteSize,
+    templateCount: fullTemplates.length,
+    drawingCount: fullDrawings.length,
+    imageCount: resolvedImageCount,
+  };
+}
+
+/**
+ * When restoring or importing a JSON backup, automatically stores any embedded
+ * Data URL images into IndexedDB (with deduplication) and converts them into memory Object URLs.
+ * This completely avoids overwhelming localStorage during large JSON imports!
+ */
+export async function restoreImportedImagesToVault(
+  payload: ValidatedBackupPayload,
+  onProgress?: (current: number, total: number) => void
+): Promise<{
+  templates: DfmTemplate[];
+  drawings: DfmDrawingItem[] | null;
+  reportBatch: CompiledReportItem[] | null;
+}> {
+  if (!isIndexedDbSupported()) {
+    // If IndexedDB is not supported, return items as is
+    return {
+      templates: payload.templates,
+      drawings: payload.drawings,
+      reportBatch: payload.reportBatch,
+    };
+  }
+
+  const allItemsWithImages: Array<{
+    target: 'template' | 'drawing' | 'batch';
+    index: number;
+    url: string;
+  }> = [];
+
+  payload.templates.forEach((t, idx) => {
+    if (t.imageUrl && t.imageUrl.startsWith('data:')) {
+      allItemsWithImages.push({ target: 'template', index: idx, url: t.imageUrl });
+    }
+  });
+
+  if (payload.drawings) {
+    payload.drawings.forEach((d, idx) => {
+      if (d.url && d.url.startsWith('data:')) {
+        allItemsWithImages.push({ target: 'drawing', index: idx, url: d.url });
+      }
+    });
+  }
+
+  if (payload.reportBatch) {
+    payload.reportBatch.forEach((b, idx) => {
+      if (b.imageUrl && b.imageUrl.startsWith('data:')) {
+        allItemsWithImages.push({ target: 'batch', index: idx, url: b.imageUrl });
+      }
+    });
+  }
+
+  const total = allItemsWithImages.length;
+  let processed = 0;
+
+  // Cache to deduplicate duplicate Data URLs during import
+  const urlToVaultMap = new Map<string, { imageId: string; blobUrl: string }>();
+
+  for (const item of allItemsWithImages) {
+    let vaultEntry = urlToVaultMap.get(item.url);
+    if (!vaultEntry) {
+      const res = await saveDataUrlToVault(item.url, { source: 'import' });
+      if (res.ok && res.imageId) {
+        vaultEntry = { imageId: res.imageId, blobUrl: res.blobUrl };
+        urlToVaultMap.set(item.url, vaultEntry);
+      }
+    }
+    processed++;
+    onProgress?.(processed, total);
+  }
+
+  // Update templates
+  const finalTemplates = payload.templates.map((t) => {
+    if (t.imageUrl && urlToVaultMap.has(t.imageUrl)) {
+      const entry = urlToVaultMap.get(t.imageUrl)!;
+      return { ...t, imageUrl: entry.blobUrl, imageId: entry.imageId };
+    }
+    return t;
+  });
+
+  // Update drawings
+  const finalDrawings = payload.drawings
+    ? payload.drawings.map((d) => {
+        if (d.url && urlToVaultMap.has(d.url)) {
+          const entry = urlToVaultMap.get(d.url)!;
+          return { ...d, url: entry.blobUrl, imageId: entry.imageId };
+        }
+        return d;
+      })
+    : null;
+
+  // Update reportBatch
+  const finalBatch = payload.reportBatch
+    ? payload.reportBatch.map((b) => {
+        if (b.imageUrl && urlToVaultMap.has(b.imageUrl)) {
+          const entry = urlToVaultMap.get(b.imageUrl)!;
+          return { ...b, imageUrl: entry.blobUrl, imageId: entry.imageId };
+        }
+        return b;
+      })
+    : null;
+
+  return {
+    templates: finalTemplates,
+    drawings: finalDrawings,
+    reportBatch: finalBatch,
+  };
 }
